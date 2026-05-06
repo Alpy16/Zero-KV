@@ -1,3 +1,4 @@
+use kv_store::{HEADER_SIZE, Header, IndexEntry};
 use std::fs::File;
 use std::io::{self, Write};
 use thiserror::Error; // Custom error derivation
@@ -32,7 +33,9 @@ fn main() -> Result<(), BakerError> {
         count: raw_data.len() as u64, // 'raw_data' is our sorted Vec
         padding: 0,
     };
-    let header_size = std::mem::size_of::<Header>() as u64;
+
+    // We pull these sizes directly from the types defined in lib.rs
+    let header_size = HEADER_SIZE as u64;
     let index_entry_size = std::mem::size_of::<IndexEntry>() as u64;
 
     // we do our jump math:
@@ -109,20 +112,4 @@ fn main() -> Result<(), BakerError> {
 
     println!("Successfully baked storage.db");
     Ok(())
-}
-
-#[repr(C)] // basically says use C data structure layout
-struct Header {
-    magic: u64, // a sequence of characters and number that verifies data type is the one we want (jpeg. pdf. json etc)
-    version: u64, // makes sure our versions are the same even if the data type is the same
-    count: u64, // how many entries there are in the file (how many stat and coordinate sheets for the data blob)
-    padding: u64, // 8 bytes (Ensures Header is 32 bytes, which is a nice round number for alignment and makes it easier to read the file)
-}
-
-#[repr(C)]
-struct IndexEntry {
-    key: u64, // ID number for the specific data in the blob, our index will have them numbered so you can say grab me data no 50
-    val_offset: u64, // absolute offset from byte 0, where the file begins basically
-    val_len: u32, // how long after offset does the file end, so basically tells the system how much to read
-    _padding: u32, // 4 bytes (Ensures IndexEntry is 24 bytes)
 }
