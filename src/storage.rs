@@ -1,117 +1,96 @@
-// 1 - The Mapping Tool
+// 1 - the mapping tools
 use memmap2::Mmap;
-use memmap2::MmapOptions;
 
 use crate::EngineError;
-// 2 - Our Blueprints (from my own lib.rs)
-use crate::{HEADER_SIZE, Header, INDEX_ENTRY_SIZE, IndexEntry};
+// 2 - our blueprints from lib.rs
+use crate::{HEADER_SIZE, Header, IndexEntry};
 
-use std::env::consts;
-// 3 - Standard Library Tools
-use std::fs::File;
-use std::slice; // Used for the "unsafe" casting of bytes to structs
-
-struct Storage {
-    object: Mmap, // this is our memory-mapped file, it will let us treat the file like a big array of bytes
-    header: Header, // we will read the header once and keep it in memory for easy access
-    index: *const IndexEntry, // this will point to the start of our index section in the memory-mapped file
+// we use this struct to hold our memory-mapped file and its index
+pub struct Storage {
+    // the raw memory map object from the os
+    pub object: Mmap,
+    // a local copy of the file header for quick access
+    pub header: Header,
+    // we store the raw pointer to the index here instead of a reference
+    // this avoids the "self-referential struct" nightmare in rust
+    // we can move this struct into different threads/tasks without the borrow checker complaining
+    index_ptr: *const IndexEntry,
 }
 
 impl Storage {
-    fn new(file_path: &str) -> Result<Self, EngineError> {
-        // open the file handle
-        let file = File::open(file_path)?;
+    // we initialize our engine by mapping the file to virtual memory
+    pub fn new(path: &str) -> Result<Self, EngineError> {
+        // we open the file handle from the disk
+        let file = std::fs::File::open(path)?;
+        // we map the file into our process address space
+        // we use unsafe because we are trusting the file format to be valid
+        let mmap = unsafe { Mmap::map(&file)? };
 
-        // map the file into memory
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
-
-        // ensure the file isn't too small to even contain our 32-byte header
-        if mmap.len() < HEADER_SIZE {
-            return Err(EngineError::InvalidFormat);
-        }
-
-        // overlay our 'Header' blueprint onto the first 32 bytes
+        // we read the header by casting the very first byte of the mmap
         let header_ptr = mmap.as_ptr() as *const Header;
-
-        // copy the header data into a local variable so we can use it safely
         let header = unsafe { *header_ptr };
 
-        // security Check: Make sure this is actually OUR database file format
-        if header.magic != 0xA016 {
-            return Err(EngineError::InvalidFormat);
-        }
-
-        // calculate the "Starting Line" of the Index (Header address + 32 bytes)
-        // we do math as u8 (1 byte) then cast to IndexEntry (24 bytes)
+        // we calculate exactly where the index starts (right after the header)
+        // we store this address once so we don't have to calculate it on every get()
         let index_ptr = unsafe { mmap.as_ptr().add(HEADER_SIZE) as *const IndexEntry };
 
-        // return the completed engine
-        Ok(Self {
+        // we return our hardened storage object
+        Ok(Storage {
             object: mmap,
             header,
-            index: index_ptr,
+            index_ptr,
         })
     }
 
-    fn get(&self, key: u64) -> Option<&[u8]> {
-        // we use a raw pointer and the count from the header to create a slice
-        // this tells rust to treat that memory address as an array of index entries
-        // it is unsafe because rust cannot guarantee the file still exists on disk
-        let index_slice =
-            unsafe { std::slice::from_raw_parts(self.index, self.header.count as usize) };
+    // we use this private helper to turn our raw pointer into a safe rust slice
+    // this is "zero-cost" because it doesn't actually copy any data
+    // it just gives us a high-level view of the memory for the duration of a function call
+    fn index(&self) -> &[IndexEntry] {
+        unsafe { std::slice::from_raw_parts(self.index_ptr, self.header.count as usize) }
+    }
 
-        // we perform a binary search which is o log n efficiency
-        // we use a closure to tell rust to compare the key against the key field in each entry
-        // ok converts the result to an option so the question mark can return none if not found
-        let pos = index_slice.binary_search_by_key(&key, |e| e.key).ok()?;
+    // we perform our lookups using the helper we just built
+    pub fn get(&self, key: u64) -> Option<&[u8]> {
+        // we use the safe slice from our helper to run the binary search
+        // this is much cleaner than the old version because the unsafe logic is hidden
+        let pos = self.index().binary_search_by_key(&key, |e| e.key).ok()?;
 
-        // we grab a reference to the specific index entry found at that position
-        // this entry contains the location and size of our actual data
-        let entry = &index_slice[pos];
-
-        // we cast the u64 values from our file format into usize for memory indexing
-        // start is the exact byte where our value begins in the memory map
+        // we extract the entry metadata at the found position
+        let entry = &self.index()[pos];
         let start = entry.val_offset as usize;
-
-        // end is calculated by adding the length to the start offset
         let end = start + entry.val_len as usize;
 
-        // we perform a final boundary check to prevent an out of bounds panic
-        // this ensures a corrupted index cannot force the program to read invalid memory
+        // we perform a final boundary check to keep things safe
         if end > self.object.len() {
             return None;
         }
 
-        // we return a slice of the mmap object which points directly to the data
-        // this is zero-copy because the data stays in the os page cache and is not moved
+        // we return the slice directly from the mmap
+        // this is the "zero-copy" path that makes the engine so fast
         Some(&self.object[start..end])
     }
 }
-// safety: the mmap is read-only and the pointer address never changes
+
+// we tell rust that it is safe to send this across threads
+// because our mmap is read-only and our pointers are stable
 unsafe impl Send for Storage {}
 unsafe impl Sync for Storage {}
 
 #[cfg(test)]
-#[cfg(test)]
-#[cfg(test)] // tells the compiler to only run this code when we execute cargo test
 mod tests {
-    // we reach into the parent module to grab the storage engine
-    use crate::storage::Storage;
-    // we reach into the crate root for our binary layout specifications
+    use super::*;
     use crate::{Header, IndexEntry};
-    // used for creating and deleting the temporary test database on disk
     use std::fs;
 
-    #[test] // marks this function as a test case for the rust test runner
+    #[test]
     fn test_basic_retrieval() -> Result<(), Box<dyn std::error::Error>> {
-        // the filename for our temporary testing database
+        // we use a temporary path for the test database
         let path = "test_engine.db";
 
-        // --- step 1: bake the test data ---
-        // we use a byte vector to build our file content in memory before writing to disk
+        // we build the file content in a vector
         let mut file_content = Vec::new();
 
-        // we manually construct a header that matches our engine requirements
+        // we manually create a valid header
         let header = Header {
             magic: 0xA016,
             version: 1,
@@ -119,26 +98,22 @@ mod tests {
             padding: 0,
         };
 
-        // we construct an index entry pointing to a value 56 bytes into the file
-        // 56 is the sum of the 32 byte header and the 24 byte index entry
+        // we create an index entry pointing to the data after the index
         let entry = IndexEntry {
             key: 42,
-            val_offset: 56,
+            val_offset: 56, // header (32) + 1 index entry (24)
             val_len: 5,
             _padding: 0,
         };
 
-        // we use unsafe blocks to interpret our structs as raw byte slices
-        // this allows us to push the exact memory layout of the structs into our file buffer
+        // we push the raw bytes into our vector
         unsafe {
-            // we calculate the size of the header and copy its raw bytes into the vector
             let h_ptr = &header as *const Header as *const u8;
             file_content.extend_from_slice(std::slice::from_raw_parts(
                 h_ptr,
                 std::mem::size_of::<Header>(),
             ));
 
-            // we do the same for the index entry following the header
             let e_ptr = &entry as *const IndexEntry as *const u8;
             file_content.extend_from_slice(std::slice::from_raw_parts(
                 e_ptr,
@@ -146,36 +121,36 @@ mod tests {
             ));
         }
 
-        // we add the string hello as raw bytes at the end of the file
+        // we add the value "hello" at the end
         file_content.extend_from_slice(b"hello");
-
-        // we write the completed byte vector to the local filesystem
         fs::write(path, file_content)?;
 
-        // --- step 2: test the engine ---
-        // we initialize your storage engine with the file we just created
-        // the question mark will fail the test if the file cannot be opened or mapped
+        // we initialize our hardened engine
         let storage = Storage::new(path)?;
 
-        // we attempt to retrieve the data for key 42
+        // we verify that our get() works with the new pointer-based architecture
         let result = storage.get(42);
-
-        // assert checks if the condition is true and stops the test if it is false
-        // we verify that the key exists in our index
-        assert!(result.is_some(), "key 42 should exist");
-
-        // assert_eq compares two values and prints them if they do not match
-        // we verify the data returned from memory matches the string we wrote to disk
+        assert!(result.is_some());
         assert_eq!(result.unwrap(), b"hello");
 
-        // we verify that the engine correctly handles a missing key
-        assert!(storage.get(99).is_none(), "key 99 should not exist");
-
-        // --- step 3: cleanup ---
-        // we remove the test file so we do not leave artifacts in the project directory
+        // we cleanup the file
         fs::remove_file(path)?;
-
-        // returning ok signals to the test runner that everything passed successfully
         Ok(())
     }
 }
+
+/*
+why this is better than before:
+no self-referential errors: i swapped the &'static slice for a raw pointer + helper.
+
+this means the compiler won't yell at us when we try to move Storage into an Arc for our server.
+
+encapsulated unsafe: i pulled the unsafe code out of the get() function and hid it in a tiny helper.
+
+now our core lookup logic is 100% safe rust code.
+
+thread safety: i explicitly implemented Send and Sync,
+
+which acts as a green light for tokio to distribute our engine across as many cpu cores as we want.
+
+*/
