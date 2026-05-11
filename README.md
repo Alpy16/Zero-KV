@@ -1,77 +1,105 @@
-# High-Performance Disk-Backed Storage Engine
+# Zero-KV: High-Performance Disk-Backed Storage Engine
 
-A specialized key-value storage engine built in Rust, designed for sub-microsecond lookups. This project focuses on low-level systems programming, zero-copy data transfer, and memory-mapped file I/O.
+**A specialized key-value retrieval engine optimized for sub-microsecond latency through memory-mapped I/O and zero-copy abstractions.**
 
-## Architecture
-
-The engine utilizes `mmap(2)` to treat disk storage as an extension of application memory, allowing the Operating System to handle page caching and hardware-level optimizations.
-
-### Technical Specifications
-
-* **Zero-Copy:** Data is served directly from the OS page cache to the caller without being copied into intermediate buffers.
-* **O(log n) Lookups:** The index is pre-sorted, enabling lightning-fast binary searches.
-* **Memory-Aligned:** Structs use `#[repr(C)]` with natural padding to ensure 8-byte alignment, maximizing CPU throughput and satisfying Rust's safety requirements.
-* **Memory Efficiency:** The engine maps the file address space rather than loading the entire dataset into RAM.
+Zero-KV is engineered to bridge the performance gap between persistent disk storage and volatile RAM. By leveraging the `mmap(2)` system call, the engine treats on-disk binary structures as an extension of the process address space. This architecture allows the operating system kernel to manage page caching and demand-paging, enabling the engine to serve data directly from the kernel page cache to the network interface without intermediate CPU copies or heap allocations.
 
 ---
 
-## The 6-Stage Roadmap
+## Core Engineering Principles
+
+* **Zero-Copy Architecture**: Utilizing the `zerocopy` crate, incoming network frames and on-disk structures are interpreted as typed references rather than being parsed or deserialized.
+* **Mechanical Sympathy**: The binary schema is strictly aligned to 8-byte boundaries. This ensures that 64-bit keys and offsets reside on natural CPU word boundaries, preventing the significant performance penalties associated with unaligned memory access.
+* **Asynchronous Concurrency**: Built on the `tokio` runtime, the engine utilizes a non-blocking multi-threaded executor. A shared-state architecture managed via `Arc` (Atomic Reference Counting) allows thousands of concurrent "researcher" tasks to query the memory-mapped index without lock contention.
+* **Deterministic Retrieval**: The engine utilizes a pre-sorted binary index, enabling $O(\log n)$ lookups via binary search. This provides predictable P99 latency profiles compared to hash-based engines that may suffer from re-indexing or collision overhead.
+
+---
+
+## Technical Roadmap
 
 ### Stage 1: The Baker (Complete)
 
-A CLI tool that sorts a dataset by key and serializes it into a custom binary format.
-
-* **Header:** A 32-byte metadata block containing magic numbers and item counts.
-* **Index:** A contiguous block of fixed-width `IndexEntry` structs.
+A high-efficiency serialization tool that transforms raw datasets into a memory-aligned binary format. It performs the necessary sorting and padding during the build phase to eliminate runtime overhead.
 
 ### Stage 2: The Mmap Reader (Complete)
 
-The core retrieval logic. This stage involves:
-
-* Mapping the binary file into the process address space using `memmap2`.
-* A robust `get()` API returning `Option<&[u8]>`.
+The retrieval core that maps the binary database into virtual memory. It supports datasets larger than physical RAM by relying on the OS page cache for intelligent data persistence.
 
 ### Stage 3: The Protocol (Complete)
 
-Defined a rigorous, fixed-width binary frame for network communication.
+A rigorous, fixed-width binary specification for network communication.
 
-* **Request:** 16-byte frame (4-byte OpCode + 4-byte Padding + 8-byte Key).
-* **Response:** 8-byte header (4-byte Status + 4-byte Length).
-* **Endianness:** All values use Network Byte Order (Big-Endian) for cross-platform compatibility.
+* **Request Frame**: 16-byte aligned (4-byte OpCode, 4-byte Padding, 8-byte Key).
+* **Response Frame**: 8-byte header (4-byte Status, 4-byte Length) followed by raw data.
 
-### Stage 4: The Async Server (Pending)
+### Stage 4: The Async Server (Complete)
 
-Building a high-concurrency TCP listener using `tokio` to allow multiple clients to query the engine simultaneously.
+A multi-threaded TCP listener utilizing `tokio`. This stage includes structured logging via the `tracing` ecosystem for real-time observability of connection lifecycles and lookup performance.
 
-### Stage 5: The Zero-Copy Path (Pending)
+### Stage 5: The Zero-Copy Path (Current Focus)
 
-Implementing `writev` (vectored I/O) to stream data directly from the memory map to the network socket.
+Optimization of the write path using Vectored I/O (`writev`). This eliminates multiple system calls by aggregating the response header and data payload into a single atomic kernel operation.
 
-### Stage 6: The Benchmarker (Pending)
+### Stage 6: The Benchmarker (Planned)
 
-A load-testing suite designed to generate flamegraphs and prove P99 latencies under 50 microseconds.
-
----
-
-## Technical Note: The "Packed vs. Aligned" Shift
-
-Initially, i utilized `#[repr(packed)]` to achieve a 12-byte request size. However, the project shifted to a 16-byte **aligned** layout for two critical reasons:
-
-1. **Safety:** Rust strictly forbids taking references to unaligned fields in packed structs, as this constitutes Undefined Behavior (UB). Even calling conversion methods on unaligned fields can trigger these protections.
-2. **Performance:** Modern CPUs are optimized to read 64-bit integers from addresses that are multiples of 8. By embracing 4 bytes of padding between the OpCode and the Key, we allow the CPU to fetch keys in a single cycle without the heavy penalty of shifted or split memory reads.
+A high-concurrency load-testing suite designed to validate sub-50 microsecond P99 latencies and generate flamegraphs for kernel-level performance profiling.
 
 ---
 
-## Binary Format Layout
+## Design Rationale: Memory Alignment and Safety
+
+A critical architectural transition occurred during Stage 3, moving from a 12-byte packed request format to a 16-byte aligned format.
+
+| Feature | Packed Layout | Aligned Layout |
+| --- | --- | --- |
+| **Request Size** | 12 Bytes | 16 Bytes |
+| **Memory Access** | Unaligned (Shifted) | **Natural (Single-Cycle)** |
+| **Safety Profile** | Potential Undefined Behavior | **Memory Safe / Repr(C)** |
+
+**Engineering Trade-off**: While a packed layout reduces network bandwidth by 25%, it introduces significant CPU overhead and risks hardware-level exceptions on strict-alignment architectures. By introducing 4 bytes of internal padding, the engine ensures that 8-byte keys are naturally aligned, allowing the hardware to fetch data in a single clock cycle.
+
+---
+
+## Binary Format Specification
 
 | Section | Size | Description |
 | --- | --- | --- |
-| **Header** | 32 Bytes | Magic (0xA016), Version, Entry Count |
-| **Index** | 24 Bytes * N | Sorted Keys, Val Offsets, Val Lengths |
-| **Data** | Variable | Raw value bytes |
+| **Header** | 32 Bytes | Magic ID (`0xA016`), Versioning, and Entry Metadata. |
+| **Index** | 24 Bytes * N | Contiguous block of sorted 8-byte Keys and Data Offsets. |
+| **Data** | Variable | Raw value segments, 8-byte padded to maintain alignment. |
 
 ---
 
-**Author:** [Alpy16](https://github.com/Alpy16)
+## Observability
 
-**License:** MIT
+The engine utilizes structured logging to provide granular visibility into server operations. Log levels are categorized to distinguish between routine lifecycle events and performance-critical warnings:
+
+* **INFO**: Connection establishment, engine initialization, and successful lookups.
+* **WARN**: Cache misses or lookups for non-existent keys.
+* **ERROR**: Protocol violations or network I/O failures.
+
+---
+
+## Usage
+
+### Build and Serialize
+
+```bash
+cargo run --bin baker
+
+```
+
+### Initialize Server
+
+```bash
+cargo run --bin kv_store
+
+```
+
+The engine will bind to `127.0.0.1:5500`.
+
+---
+
+**Author**: [Alpy16](https://github.com/Alpy16)
+
+**License**: MIT

@@ -47,6 +47,7 @@ name = "kv_store"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "memmap2",
  "thiserror",
  "tokio",
