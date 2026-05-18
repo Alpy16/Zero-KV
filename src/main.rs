@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
-// we bring in our protocol blueprints from the library
-use kv_store::{Request, ResponseHeader};
-// we bring in the storage engine
 use kv_store::storage::Storage;
-use tracing::{error, info, warn};
-
-// we use arc to share our engine safely across many tasks
+use kv_store::{Request, ResponseHeader};
 use std::sync::Arc;
-// we use tokio's async tools for non-blocking networking
+use tracing::{error, info, warn};
+// we bring in standard ioslice for our non-contiguous memory gather writes
+use std::io::IoSlice;
+// we add Duration and timeout for our security hardening
+use std::time::Duration;
+use tokio::time::timeout;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -16,17 +17,17 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     info!("zero-kv engine initializing...");
+
     // 1. the engine setup
     // we load the database from the disk once
-    // we use unwrap here because if the file is missing, the server can't start anyway
-    let storage = Storage::new("storage.db").unwrap();
+    let storage = Storage::new("storage.db").expect("failed to load storage.db");
 
     // we wrap the engine in an arc (atomic reference counter)
-    // this allows us to give every client connection a "key" to the same data
+    // this lets us safely hand out read access tokens to multiple async tasks
     let engine = Arc::new(storage);
 
     // 2. the open sign
-    // we tell the operating system to listen for incoming bytes on port 5500
+    // we bind our listener to a local port to await client incoming streams
     let listener = TcpListener::bind("127.0.0.1:5500")
         .await
         .context("failed to bind to port 5500")?;
@@ -34,60 +35,106 @@ async fn main() -> Result<()> {
 
     // 3. the receptionist loop
     loop {
-        // we wait here (without using cpu) until a client connects
         let (mut socket, _addr) = listener.accept().await?;
         info!("accepted connection from {}", _addr);
 
-        // we make a fast clone of the engine's pointer
-        // this doesn't copy the database, it just increments a counter
         let engine_clone = Arc::clone(&engine);
 
         // we spawn a new "researcher" task to handle this specific client
-        // the 'move' keyword lets this task take ownership of its own socket and engine clone
         tokio::spawn(async move {
-            // we create a 16-byte buffer to hold the incoming request frame
             let mut buf = [0u8; 16];
 
-            // we read exactly 16 bytes from the client socket
-            if socket.read_exact(&mut buf).await.is_ok() {
-                // we map those 16 bytes directly onto our Request struct
-                // this is our zero-copy path: no parsing, just reinterpreting memory
-                if let Some(req) = Request::from_bytes(&buf) {
-                    // we ask the engine to find the value for the requested key
-                    // req.key.get() handles the big-endian to native conversion for us
-                    let result = engine_clone.get(req.key.get());
+            // we give the client exactly 5 seconds to send their 16-byte request frame
+            // if they hang, the 'timeout' future will return an error, and we drop the connection
+            let read_result = timeout(Duration::from_secs(5), socket.read_exact(&mut buf)).await;
 
-                    // we decide what to send back based on what the engine found
-                    match result {
-                        Some(data) => {
-                            info!(
-                                "lookup success: key {} ({} bytes)",
-                                req.key.get(),
-                                data.len()
-                            );
-                            // we found the key! we prepare a header with status 0 (ok)
-                            let head = ResponseHeader {
-                                status: 0.into(),
-                                length: (data.len() as u32).into(),
-                            };
-                            // we write the 8-byte header first
-                            let _ = socket.write_all(zerocopy::AsBytes::as_bytes(&head)).await;
-                            // then we write the raw value bytes directly from the mmap
-                            let _ = socket.write_all(data).await;
-                        }
-                        None => {
-                            warn!("lookup miss: key {} not found", req.key.get());
-                            // key not found: we send back status 1 (not found)
-                            let head = ResponseHeader {
-                                status: 1.into(),
-                                length: 0.into(),
-                            };
-                            let _ = socket.write_all(zerocopy::AsBytes::as_bytes(&head)).await;
+            match read_result {
+                Ok(Ok(_)) => {
+                    // the client sent the bytes in time!
+                    if let Some(req) = Request::from_bytes(&buf) {
+                        let result = engine_clone.get(req.key.get());
+
+                        match result {
+                            Some(data) => {
+                                info!(
+                                    "lookup success: key {} ({} bytes)",
+                                    req.key.get(),
+                                    data.len()
+                                );
+
+                                // we found the data, so we initialize an ok (0) response header
+                                let head = ResponseHeader {
+                                    status: 0.into(),
+                                    length: (data.len() as u32).into(),
+                                };
+
+                                // STAGE 5: The Zero-Copy Path
+                                // we cast our fixed header struct into a safe raw byte slice view
+                                let header_bytes = zerocopy::AsBytes::as_bytes(&head);
+
+                                // we gather our separate memory spaces into an array of io descriptors
+                                // slice 1 points to our stack header, slice 2 points directly into the mmap
+                                let bufs = [IoSlice::new(header_bytes), IoSlice::new(&data)];
+
+                                // we sum up the total expected packet size to catch any partial writes
+                                let total_expected = header_bytes.len() + data.len();
+
+                                // we issue exactly one system call to let the kernel stream both regions
+                                match socket.write_vectored(&bufs).await {
+                                    Ok(n) => {
+                                        info!("sent {} bytes to {}", n, _addr);
+
+                                        // systems defense: if the network chokes, we handle partial flushes
+                                        if n < total_expected {
+                                            warn!(
+                                                "partial write to {}: sent {} of {} bytes",
+                                                _addr, n, total_expected
+                                            );
+
+                                            if n < header_bytes.len() {
+                                                // case A: the header itself got cut short.
+                                                // we finish sending the remainder of the header, then all the data
+                                                let _ = socket.write_all(&header_bytes[n..]).await;
+                                                let _ = socket.write_all(data).await;
+                                            } else {
+                                                // case B: the header cleared, but the data payload fractured.
+                                                // we calculate our progress into the mmap slice and flush the rest
+                                                let data_written = n - header_bytes.len();
+                                                let _ =
+                                                    socket.write_all(&data[data_written..]).await;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("failed to send response to {}: {}", _addr, e);
+                                    }
+                                }
+                            }
+                            None => {
+                                warn!("lookup miss: key {} not found", req.key.get());
+                                // key not found: we send back status 1 (not found)
+                                let head = ResponseHeader {
+                                    status: 1.into(),
+                                    length: 0.into(),
+                                };
+                                if let Err(e) =
+                                    socket.write_all(zerocopy::AsBytes::as_bytes(&head)).await
+                                {
+                                    error!("failed to send response to {}: {}", _addr, e);
+                                }
+                            }
                         }
                     }
                 }
+                Ok(Err(e)) => {
+                    // a standard network error occurred
+                    error!("read error from {}: {}", _addr, e);
+                }
+                Err(_) => {
+                    // the 5-second timer expired
+                    warn!("client {} timed out while sending request", _addr);
+                }
             }
         });
-        // after spawning the task, we immediately loop back to wait for the next client
     }
 }

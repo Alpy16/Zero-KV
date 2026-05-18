@@ -100,6 +100,14 @@ The engine will bind to `127.0.0.1:5500`.
 
 ---
 
+## Production Considerations & Hardening
+
+While Zero-KV is optimized for peak performance, the following hardening measures are identified for production environments:
+
+* **Bus Error (SIGBUS) Safety:** Current memory-mapping relies on file stability. Future iterations will implement advisory file locking to prevent process crashes during external file truncation.
+* **Request Timeouts:** To prevent resource exhaustion from "Slowloris" style attacks, asynchronous I/O operations should be wrapped in strict dead-line timers.
+* **Congestion Control:** Implementing a semaphore-based backpressure mechanism to limit concurrent "researcher" tasks, ensuring the system remains responsive under extreme load.
+
 **Author**: [Alpy16](https://github.com/Alpy16)
 
 **License**: MIT

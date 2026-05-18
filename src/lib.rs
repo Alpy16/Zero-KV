@@ -24,8 +24,12 @@ pub enum EngineError {
     #[error("File collision: {0}")]
     FileCollision(String),
 
-    #[error("Invalid storage file: Magic number or version mismatch")]
-    InvalidFormat,
+    // updated to match your new hardening logic
+    #[error("Invalid storage file: Magic number mismatch")]
+    MagicMismatch,
+
+    #[error("Invalid storage file: Header is too small or corrupted")]
+    InvalidHeader,
 
     #[error("Key not found: {0}")]
     KeyNotFound(u64),
