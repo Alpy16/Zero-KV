@@ -1,45 +1,51 @@
 # Changelog
 
-All notable changes to the Zero-KV project will be documented in this file.
+All notable changes and architectural milestones for the Zero-KV storage engine project are documented in this file.
 
-## [Unreleased]
+## [Stage 5] - The Zero-Copy Path
 
 ### Added
-
-* Planned implementation of Vectored I/O (writev) for Stage 5 optimization.
-* Planned high-concurrency benchmarking suite for Stage 6.
-
-## [0.4.0] - 2026-05-10
+* Integrated vectored I/O (`write_vectored`) into the hot path of the server connection loop using standard library `IoSlice` handles.
+* Implemented an allocation-free stack structure to arrange non-contiguous memory segments (the stack-allocated response header and the memory-mapped value slice) for atomic transmission.
+* Introduced a bulletproof partial-write defense mechanism to intercept network backpressure conditions without dropping bytes or causing runtime slicing panics.
+* Added a dedicated integration testing suite (`tests/smoke_test.rs`) to evaluate protocol behavior, socket connectivity, numeric key lookups, and missing key responses over local network streams.
 
 ### Changed
+* Refactored the network success path inside the asynchronous task runner, replacing sequential, multi-step socket writes with a single unified kernel context switch.
+* Cleaned up the error handling logic in the connection loop, shifting raw expressions into contextual, lowercase tracing blocks.
 
-* **Architectural Refactor**: Comprehensive restructuring of the codebase to support asynchronous task spawning and thread-safe state management.
-* **Library Hardening**: Refactored the storage engine to be Send + Sync, enabling integration with the Tokio runtime.
+---
 
-### Added
-
-* **Project Documentation**: Initialized the changelog to track versioned progress and architectural shifts.
-
-## [0.3.0] - 2026-05-08
+## [Stage 4] - The Async Server
 
 ### Added
+* Implemented a performance-first TCP listening server leveraging the `tokio` multi-threaded runtime.
+* Enforced connection hardening by wrapping socket reads inside an asynchronous 5-second `timeout` wrapper to actively prevent slowloris resource exhaustion attacks.
+* Added structural token tracking by wrapping the core memory-mapped storage controller inside an atomic reference counter (`Arc`) for safe cross-thread distribution.
 
-* **Stage 3 Protocol**: Defined the fixed-width binary request and response frames.
-* **Alignment Specifications**: Implementation of 8-byte natural alignment for network-delivered keys to ensure single-cycle CPU fetches.
-* **Zero-Copy Deserialization**: Integration of the zerocopy crate for non-allocating frame interpretation.
+---
 
-## [0.2.0] - 2026-05-07
-
-### Added
-
-* **Stage 2 Retrieval**: Integration of memory-mapped file I/O via memmap2 for disk-backed storage.
-* **Core API**: Implementation of the binary search lookup logic over memory-mapped index offsets.
-* **Project Roadmap**: Added a comprehensive README outlining the 6-stage development plan and technical architecture.
-
-## [0.1.0] - 2026-05-04
+## [Stage 3] - The Protocol
 
 ### Added
+* Designed a rigorous, fixed-width binary frame specification (16 bytes for requests, 8 bytes for response headers) to eliminate stream delimiter scanning.
+* Integrated the `zerocopy` crate ecosystem to safely cast raw network buffer arrays directly into structural data types without allocation overhead.
+* Introduced big-endian network alignment types (`U32`, `U64`) to stabilize data consistency across differing hardware architectures.
 
-* **Initial Commit**: Established the project structure and the foundational Baker CLI for data serialization.
-* **Error Handling**: Implemented custom error types and centralized error propagation on top of the initial key-value store logic.
-* **Index Serialization**: Initial implementation of sorted binary index generation for O(log n) lookup efficiency.
+---
+
+## [Stage 2] - The Mmap Reader
+
+### Added
+* Constructed the core storage engine backend mapping database storage files straight into virtual memory using the `memmap2` driver interface.
+* Authored an unsafe transient slice pointer mechanism (`std::slice::from_raw_parts`) to generate zero-cost, safe slice views over raw binary offsets.
+* Implemented the runtime index binary search engine to locate target key offsets in logarithmic time.
+
+---
+
+## [Stage 1] - The Baker
+
+### Added
+* Built the file compiler CLI utility to pre-compile raw key-value pairs into optimized binary structures.
+* Implemented a data pre-sorting layer to ensure perfect binary search index sequencing.
+* Enforced structural 8-byte padding and alignment algorithms on written data blocks to preserve modern CPU cache efficiency.
