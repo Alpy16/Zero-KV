@@ -1,51 +1,60 @@
 # Changelog
 
-All notable changes and architectural milestones for the Zero-KV storage engine project are documented in this file.
+All notable changes to the Zero-KV storage engine will be documented in this file. This project adheres to a performance-driven development lifecycle.
 
-## [Stage 5] - The Zero-Copy Path
+## [Stage 6] - Mechanical Sympathy & Syscall Optimization
 
 ### Added
-* Integrated vectored I/O (`write_vectored`) into the hot path of the server connection loop using standard library `IoSlice` handles.
-* Implemented an allocation-free stack structure to arrange non-contiguous memory segments (the stack-allocated response header and the memory-mapped value slice) for atomic transmission.
-* Introduced a bulletproof partial-write defense mechanism to intercept network backpressure conditions without dropping bytes or causing runtime slicing panics.
-* Added a dedicated integration testing suite (`tests/smoke_test.rs`) to evaluate protocol behavior, socket connectivity, numeric key lookups, and missing key responses over local network streams.
+- **Unix Domain Sockets (UDS):** Replaced TCP with UDS to eliminate loopback networking overhead, bypassing IP headers, checksums, and Nagle's algorithm.
+- **Request Batching:** Implemented 4KB buffered reads to ingest multiple 16-byte frames in a single kernel context switch.
+- **Response Batching:** Integrated vectored I/O (`write_vectored`) to aggregate multiple responses into single system calls.
+- **Pipelining:** Updated the benchmarker to support request pipelining, enabling higher saturation of the server's batch-processing logic.
 
 ### Changed
-* Refactored the network success path inside the asynchronous task runner, replacing sequential, multi-step socket writes with a single unified kernel context switch.
-* Cleaned up the error handling logic in the connection loop, shifting raw expressions into contextual, lowercase tracing blocks.
+- **Hot-path Logging:** Migrated per-request tracing from `info!` to `debug!` to eliminate `stdout` lock contention and associated latency jitter.
+- **Allocation Strategy:** Moved response buffers outside the hot loop and pre-allocated capacities to prevent heap allocations during the request lifecycle.
+- **Borrow Checker Refactoring:** Decoupled `IoSlice` lifetimes from header buffers to facilitate memory reuse without data copying.
+
+### Fixed
+- **Tail Latency Spikes:** Reduced P99.9 latency by removing synchronous logging and high-frequency timer registrations.
 
 ---
 
-## [Stage 4] - The Async Server
+## [Stage 5] - Zero-Copy Path
 
 ### Added
-* Implemented a performance-first TCP listening server leveraging the `tokio` multi-threaded runtime.
-* Enforced connection hardening by wrapping socket reads inside an asynchronous 5-second `timeout` wrapper to actively prevent slowloris resource exhaustion attacks.
-* Added structural token tracking by wrapping the core memory-mapped storage controller inside an atomic reference counter (`Arc`) for safe cross-thread distribution.
+- **Vectored I/O:** Initial implementation of `write_vectored` for atomic transmission of non-contiguous memory (stack headers and mmap values).
+- **Smoke Tests:** Introduced `smoke_test.rs` for protocol compliance and boundary condition verification.
 
 ---
 
-## [Stage 3] - The Protocol
+## [Stage 4] - Asynchronous Runtime
 
 ### Added
-* Designed a rigorous, fixed-width binary frame specification (16 bytes for requests, 8 bytes for response headers) to eliminate stream delimiter scanning.
-* Integrated the `zerocopy` crate ecosystem to safely cast raw network buffer arrays directly into structural data types without allocation overhead.
-* Introduced big-endian network alignment types (`U32`, `U64`) to stabilize data consistency across differing hardware architectures.
+- **Tokio Integration:** Migrated to an asynchronous multi-threaded architecture.
+- **Atomic Storage Sharing:** Wrapped the storage controller in `Arc` for lock-free read access across concurrent tasks.
 
 ---
 
-## [Stage 2] - The Mmap Reader
+## [Stage 3] - Protocol Specification
 
 ### Added
-* Constructed the core storage engine backend mapping database storage files straight into virtual memory using the `memmap2` driver interface.
-* Authored an unsafe transient slice pointer mechanism (`std::slice::from_raw_parts`) to generate zero-cost, safe slice views over raw binary offsets.
-* Implemented the runtime index binary search engine to locate target key offsets in logarithmic time.
+- **Fixed-Width Frames:** Established 16-byte request and 8-byte response frame specifications.
+- **Zerocopy Casting:** Integrated `zerocopy` for allocation-free byte-to-struct mapping.
+- **Endian Stability:** Implemented big-endian alignment for network interoperability.
 
 ---
 
-## [Stage 1] - The Baker
+## [Stage 2] - Memory-Mapped Storage
 
 ### Added
-* Built the file compiler CLI utility to pre-compile raw key-value pairs into optimized binary structures.
-* Implemented a data pre-sorting layer to ensure perfect binary search index sequencing.
-* Enforced structural 8-byte padding and alignment algorithms on written data blocks to preserve modern CPU cache efficiency.
+- **Mmap Backend:** Implemented file-backed storage using `mmap2`.
+- **Kernel Hinting:** Added `Advice::Random` (madvise) to optimize the kernel's page cache management for binary search patterns.
+
+---
+
+## [Stage 1] - Data Baking
+
+### Added
+- **The Baker Utility:** Created a CLI tool for pre-compiling and sorting database files.
+- **Structural Alignment:** Enforced 8-byte boundary alignment for all data entries to optimize CPU cache line utilization.

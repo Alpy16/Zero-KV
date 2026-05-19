@@ -1,21 +1,21 @@
 use anyhow::{Context, Result};
 use kv_store::{HEADER_SIZE, Header, IndexEntry};
 use std::fs::File;
-use std::io::{self, BufWriter, Write};
+// we bring in `BufWriter` for buffered file I/O, which is more efficient for writing large amounts of data.
+use std::io::{BufWriter, Write};
 use zerocopy::AsBytes; // we use this to turn structs into bytes safely
 
-// we use anyhow now, so we can remove the manual BakerError enum and
-// let anyhow handle the context of what went wrong
-
 fn main() -> Result<()> {
-    // we create our source data just like before
+    // i think of the baker as our "ahead-of-time" optimizer. if i sort
+    // and align everything here, the server doesn't have to waste a
+    // single cpu cycle on logic when a request hits.
     let mut raw_data = vec![
         (100, b"First value content".to_vec()),
         (50, b"Second".to_vec()),
         (200, b"Third and longest value here".to_vec()),
     ];
 
-    // we sort by key to ensure our binary search works later
+    // sorting is non-negotiable; binary search needs order.
     raw_data.sort_by_key(|item| item.0);
 
     let my_header = Header {
@@ -25,13 +25,14 @@ fn main() -> Result<()> {
         padding: 0,
     };
 
-    // we do our jump math to find where the data starts
     let header_size = HEADER_SIZE as u64;
     let index_entry_size = std::mem::size_of::<IndexEntry>() as u64;
     let index_section_size = my_header.count * index_entry_size;
     let data_start_offset = header_size + index_section_size;
 
+    // `current_offset` tracks where the next value will be written in the file.
     let mut current_offset = data_start_offset;
+    // `index_entries` will store all the `IndexEntry` structs that form our index.
     let mut index_entries = Vec::new();
 
     // we calculate the positions of all our values
@@ -44,35 +45,33 @@ fn main() -> Result<()> {
             _padding: 0,
         });
 
-        // we move the offset and align it to 8 bytes for cpu efficiency
+        // this is where mechanical sympathy comes in—i'm forcing every value
+        // to start on an 8-byte boundary. it ensures the cpu can fetch data
+        // without splitting a read across cache lines.
         current_offset += val_len as u64;
         if current_offset % 8 != 0 {
             current_offset += 8 - (current_offset % 8);
         }
     }
 
-    // we create the file and wrap it in a BufWriter to make disk access faster
     let file = File::create_new("storage.db")
         .context("storage.db already exists. delete it before re-baking")?;
     let mut writer = BufWriter::new(file);
 
-    // why this is better: zero-copy "as_bytes()" replaces the unsafe pointer mess
-    // it guarantees we don't accidentally read past the struct's memory
     writer
         .write_all(my_header.as_bytes())
         .context("failed to write header")?;
 
-    // we write all index entries at once. zerocopy handles the slice conversion for us
     writer
         .write_all(index_entries.as_bytes())
         .context("failed to write index entries")?;
 
-    // we write the data blobs and their padding
     for (_, value) in &raw_data {
         writer
             .write_all(value)
             .context("failed to write data value")?;
 
+        // padding the actual file to maintain our 8-byte alignment.
         let remainder = value.len() % 8;
         if remainder != 0 {
             let padding_needed = 8 - remainder;
@@ -83,7 +82,8 @@ fn main() -> Result<()> {
         }
     }
 
-    // we flush to ensure everything is physically moved from memory to the disk platter
+    // we flush the `BufWriter` to ensure all buffered data is physically moved
+    // from memory to the disk platter, making the database file persistent.
     writer.flush().context("failed to flush data to disk")?;
 
     println!(
