@@ -3,6 +3,11 @@ name = "kv_store"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+debug = true
+lto = "fat"
+codegen-units = 1
+
 [dependencies]
 # our core engine tools
 memmap2 = "0.9"

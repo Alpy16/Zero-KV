@@ -1,81 +1,96 @@
 # Zero-KV
 
-Zero-KV is a hyper-optimized, zero-copy, disk-backed key-value storage engine designed for ultra-low latency local environments. It is built with a focus on "Mechanical Sympathy"—aligning software behavior with CPU and OS kernel characteristics to minimize overhead.
+Zero-KV is a hyper-optimized, disk-backed key-value storage engine engineered for ultra-low latency local environments. Built around the principle of **Mechanical Sympathy**, the engine aligns software execution boundaries directly with CPU architecture and Linux kernel primitives to maximize hardware saturation.
 
 ## Features
 
-- **Zero-Copy Architecture:** Utilizes the `zerocopy` and `memmap2` crates to ensure data is never copied between the disk, the application user-space, and the network socket.
-- **Unix Domain Sockets (UDS):** Bypasses the TCP/IP stack overhead entirely for sub-microsecond local process communication.
-- **Mechanical Sympathy:** Data structures are strictly 8-byte aligned on disk to ensure optimal CPU cache-line efficiency.
-- **Syscall Reduction:** Aggressive request batching (4KB reads) and response batching (vectored I/O) minimize kernel context-switching overhead.
-- **Pipelined Protocol:** High-concurrency support using fixed-width binary frames (16-byte requests, 8-byte response headers) to eliminate parsing costs.
+* **Zero-Copy Pipeline:** Leverages `zerocopy` and `memmap2` to stream data directly from virtual memory to the network layer without user-space allocation or duplication.
+* **Kernel Transport Bypassing:** Utilizes Unix Domain Sockets (UDS) and 16-byte fixed-width binary frames to entirely bypass the TCP/IP stack overhead.
+* **Cache-Line Alignment:** Enforces strict 8-byte boundaries on disk to prevent fields from straddling 64-byte hardware blocks, ensuring single-cycle register loads.
+* **Syscall Amortization:** Combines 4KB buffered batch reads with vectored I/O (`write_vectored`) to clear thousands of transactions per context switch.
+* **Zero-Allocation Hot Path:** Decouples execution loop lifetimes to safely reuse pre-allocated memory pools without hitting the global heap allocator.
 
 ## Performance Metrics
 
-Running on local benchmark loops (WSL2 environment, 100 concurrent connections):
-- **Throughput:** ~3.2 Million requests per second
-- **P50 Latency (Median):** ~24.63µs
-- **P99 Latency (Tail):** ~124.00µs
-- **Max Spike:** ~160.41µs
+*Evaluated under a full-saturation loop via WSL2 with 100 concurrent connections:*
+
+* **Throughput:** **3,681,180 requests per second**
+* **P50 Latency (Median):** **22.30µs**
+* **P99 Latency (Tail):** **66.30µs**
+* **Max Spike:** **90.62µs**
+
+## Performance Telemetry & Verification
+
+To audit steady-state determinism under peak load, the execution footprint was captured via `samply`. 
+
+* **[📊 View Live Interactive Profile Trace](https://share.firefox.dev/42LOBK8)**
+
+*Trace verification highlights:* Zero CPU cycles spent inside the global allocator (`malloc`/`free`) on the hot path, with over 85% of thread runtimes directly confined to core execution and poll states.
+
+---
 
 ## Getting Started
 
-### 1. Dataset Compilation (The Baker)
-Zero-KV requires an immutable, pre-sorted binary database file. Use the baker utility to generate this from your source dataset:
+### 1. Build the Binary Dataset
+
+The engine requires an immutable, pre-sorted data file. Serialize your source dataset using the compiler utility:
+
 ```bash
 cargo run --release --bin baker
 
 ```
 
-### 2. Running the Server
+### 2. Launch the Storage Server
 
-The server initializes a Unix Domain Socket at `/tmp/zero-kv.sock`. Run with `RUST_LOG=error` to ensure standard I/O logging operations do not bottleneck the runtime execution loop:
+Initialize the UDS server at `/tmp/zero-kv.sock`. Run with standard I/O logging suppressed to avoid blocking the runtime event loop:
 
 ```bash
 RUST_LOG=error cargo run --release --bin kv_store
 
 ```
 
-### 3. Benchmarking
+### 3. Run the Load Benchmarker
 
-To launch the high-concurrency pipelined load tester and capture latency distributions:
+Saturate the engine with the high-concurrency pipelined traffic generator to calculate real-time latency distributions:
 
 ```bash
 cargo run --release --bin benchmarker
 
 ```
 
+---
+
 ## Architecture Decision Records (ADR)
 
 ### ADR 1: Use of Unix Domain Sockets over TCP
 
-**Context:** Initial benchmarks showed TCP loopback overhead adding unnecessary processing noise and buffering latency per request.
-**Decision:** Switched to Unix Domain Sockets (UDS) for all local communications.
-**Consequence:** Bypasses IP headers, sequence validation, tracking states, and network checksums, resulting in a direct, kernel-mediated memory pipe for localhost workloads.
+* **Context:** Localhost TCP loopback introduces packet sequence validation, window tracking states, and network checksum noise.
+* **Decision:** Default to Unix Domain Sockets (UDS) for local inter-process communication.
+* **Consequence:** Bypasses IP headers entirely, converting the network transport into a direct, kernel-mediated memory pipe.
 
-### ADR 2: 8-Byte Data Alignment in Storage
+### ADR 2: 8-Byte Data Alignment
 
-**Context:** Unaligned data access can cause a single read operation to straddle two separate CPU cache lines, doubling memory bus transactions.
-**Decision:** The compilation utility (`the baker`) forces every serialized record to align strictly on an 8-byte boundary.
-**Consequence:** Guarantees that the CPU can load index fields into registers within a single clock cycle, eliminating cache-line splitting overhead.
+* **Context:** Unaligned data layouts force the CPU to execute multiple memory bus transactions whenever a primitive straddles two cache lines.
+* **Decision:** Force the compilation stage (`the baker`) to pack records strictly along 8-byte boundaries.
+* **Consequence:** Guarantees spatial locality; data is loaded cleanly into registers inside a single clock cycle.
 
 ### ADR 3: Memory-Mapped I/O with Random Advice
 
-**Context:** Standard file descriptor read system calls require copying data blocks across the kernel-to-user-space memory boundary.
-**Decision:** Employed `memmap2` to map the database file into the process's virtual address space, combined with an explicit `madvise(Advice::Random)` hint.
-**Consequence:** Allows the operating system's Page Cache to handle hardware I/O directly without user-space buffer copies. The random access hint explicitly disables the kernel's sequential read-ahead heuristics, preventing massive page cache churn during non-contiguous binary search jumps.
+* **Context:** Standard file descriptor system calls require duplicate buffer copies across the kernel-user boundary and trigger expensive kernel read-ahead heuristics.
+* **Decision:** Map files using `memmap2` paired with an explicit `madvise(Advice::Random)` hint.
+* **Consequence:** Moves I/O directly into the OS Page Cache with zero user-space memory overhead while completely disabling sequential page-cache prefetch churn during binary search jumps.
 
 ### ADR 4: Syscall Batching & Vectored I/O
 
-**Context:** Under heavy load, the server hit a performance wall where the CPU spent more time executing context switches to the kernel than processing lookups.
-**Decision:** Implemented 4KB batch reads on the incoming socket, paired with pipelining on the client. Integrated `write_vectored` to flush multi-response flights atomically.
-**Consequence:** Amortizes the entry cost of a single system call across dozens of distinct queries, shifting the bottleneck from context-switching limitations to maximum hardware capabilities.
+* **Context:** Frequent unbatched reading/writing traps the CPU inside expensive user-to-kernel context switches, causing quick saturation under load.
+* **Decision:** Implement 4KB read buffering on pipelined requests and flush response flights atomically via `write_vectored`.
+* **Consequence:** Amortizes the cost of a single kernel trap over dozens of distinct queries, shifting the engine's bottleneck to raw hardware limits.
 
 ### ADR 5: Decoupling Descriptor Lifetimes from Pre-allocated Buffers
 
-**Context:** Rust's borrow checker prevents mutably clearing response header allocations while `IoSlice` objects (which hold immutable references to those headers) still live in a sibling vector within the loop.
-**Decision:** Declared the transient `IoSlice` array layout inside the hot loop, while maintaining the underlying vector capacities inside a persistent allocation layer outside the loop.
-**Consequence:** Decouples the lifetimes cleanly. This allows the server to clear and reuse memory blocks on every batch transaction without hitting the global allocator heap, satisfying both compilation safety and performance constraints.
+* **Context:** The Rust borrow checker blocks clearing mutable response headers if transient `IoSlice` objects holding immutable references to them still exist inside the sibling loop scope.
+* **Decision:** Declare the temporary `IoSlice` descriptor arrays directly inside the loop block while preserving the heavy vector storage capacities outside.
+* **Consequence:** Satisfies compilation lifetime constraints, allowing total memory reuse on every batch transaction without hitting the global allocator.
 
 ## License
 

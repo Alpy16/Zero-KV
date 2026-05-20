@@ -43,8 +43,10 @@ async fn main() -> Result<()> {
             // i pre-allocated these to avoid hitting the heap in the hot loop.
             // every time you touch the allocator, you risk a mutex lock or a
             // latency spike, so i'm keeping the memory "warm" and reused.
-            let mut response_headers = Vec::with_capacity(32);
-            let mut data_slices = Vec::with_capacity(32);
+            // since our read buffer is 4kb and requests are 16 bytes, we can
+            // have up to 256 requests in a single batch.
+            let mut response_headers = Vec::with_capacity(256);
+            let mut data_slices = Vec::with_capacity(256);
 
             loop {
                 let n = match socket.read(&mut read_buf[leftover..]).await {
@@ -55,64 +57,60 @@ async fn main() -> Result<()> {
                 let total_bytes = leftover + n;
                 let mut consumed = 0;
 
-                response_headers.clear();
-                data_slices.clear();
+                {
+                    let mut response_slices = Vec::with_capacity(512);
+                    response_headers.clear();
+                    data_slices.clear();
 
-                // we process every 16-byte frame in our current batch.
-                // by doing lookups in a tight loop, we keep the cpu's
-                // instruction cache very happy.
-                while total_bytes - consumed >= 16 {
-                    let frame = &read_buf[consumed..consumed + 16];
-                    consumed += 16;
+                    // we process every 16-byte frame in our current batch.
+                    // by doing lookups in a tight loop, we keep the cpu's
+                    // instruction cache very happy.
+                    while total_bytes - consumed >= 16 {
+                        let frame = &read_buf[consumed..consumed + 16];
+                        consumed += 16;
 
-                    if let Some(req) = Request::from_bytes(frame) {
-                        let opcode = req.opcode();
-                        let result = engine_clone.get(req.key.get());
+                        if let Some(req) = Request::from_bytes(frame) {
+                            let opcode = req.opcode();
+                            let result = engine_clone.get(req.key.get());
 
-                        match result {
-                            Some(_) if opcode == OpCode::Exists => {
-                                response_headers.push(ResponseHeader {
-                                    status: 0.into(),
-                                    length: 0.into(),
-                                });
-                                data_slices.push(None);
-                            }
-                            Some(data) => {
-                                response_headers.push(ResponseHeader {
-                                    status: 0.into(),
-                                    length: (data.len() as u32).into(),
-                                });
-                                data_slices.push(Some(data));
-                            }
-                            None => {
-                                response_headers.push(ResponseHeader {
-                                    status: 1.into(),
-                                    length: 0.into(),
-                                });
-                                data_slices.push(None);
+                            match result {
+                                Some(_) if opcode == OpCode::Exists => {
+                                    response_headers.push(ResponseHeader {
+                                        status: 0.into(),
+                                        length: 0.into(),
+                                    });
+                                    data_slices.push(None);
+                                }
+                                Some(data) => {
+                                    response_headers.push(ResponseHeader {
+                                        status: 0.into(),
+                                        length: (data.len() as u32).into(),
+                                    });
+                                    data_slices.push(Some(data));
+                                }
+                                None => {
+                                    response_headers.push(ResponseHeader {
+                                        status: 1.into(),
+                                        length: 0.into(),
+                                    });
+                                    data_slices.push(None);
+                                }
                             }
                         }
                     }
-                }
 
-                // i had to move this inside the loop to satisfy the borrow checker.
-                // since IoSlice borrows from response_headers, this vector must
-                // be dropped so i can safely clear the headers for the next batch.
-                let mut response_slices = Vec::with_capacity(response_headers.len() * 2);
-
-                // vectored i/o is how i avoid the "final copy." i can send a header
-                // from the stack and a value from the mmap in one syscall without
-                // ever merging them into a temporary buffer.
-                for (i, header) in response_headers.iter().enumerate() {
-                    response_slices.push(IoSlice::new(header.as_bytes()));
-                    if let Some(data) = data_slices[i] {
-                        response_slices.push(IoSlice::new(data));
+                    // vectored i/o is how i avoid the "final copy."
+                    for (i, header) in response_headers.iter().enumerate() {
+                        response_slices.push(IoSlice::new(header.as_bytes()));
+                        if let Some(data) = data_slices[i] {
+                            response_slices.push(IoSlice::new(data));
+                        }
                     }
-                }
 
-                if !response_slices.is_empty() {
-                    if socket.write_vectored(&response_slices).await.is_err() {
-                        break;
+                    if !response_slices.is_empty() {
+                        if socket.write_vectored(&response_slices).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 leftover = total_bytes - consumed;
