@@ -32,8 +32,16 @@ impl Storage {
         }
 
         let header = Header::read_from(&mmap[..HEADER_SIZE]).ok_or(EngineError::InvalidHeader)?;
-        if !header.is_valid() {
+        if header.magic != 0xA016 {
             return Err(EngineError::MagicMismatch);
+        }
+        if header.version != 1 {
+            return Err(EngineError::VersionMismatch(header.version));
+        }
+
+        let total_index_size = header.count as usize * std::mem::size_of::<IndexEntry>();
+        if mmap.len() < HEADER_SIZE + total_index_size {
+            return Err(EngineError::IndexSizeMismatch);
         }
 
         let index_ptr = unsafe { mmap.as_ptr().add(HEADER_SIZE) as *const IndexEntry };
@@ -48,6 +56,8 @@ impl Storage {
     // i'm inlining this so the compiler just treats the index as a direct
     // array access, removing any function call overhead from the hot path.
     fn index(&self) -> &[IndexEntry] {
+        // SAFETY: The pointer was derived from a valid Mmap that we own, and we
+        // verified the length in Storage::new. The mmap is read-only.
         unsafe { std::slice::from_raw_parts(self.index_ptr, self.header.count as usize) }
     }
 

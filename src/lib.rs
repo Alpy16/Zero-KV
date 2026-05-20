@@ -7,6 +7,10 @@ use zerocopy::{
     byteorder::network_endian::{U32, U64},
 };
 
+/// Default configuration constants used across the engine and tools.
+pub const DEFAULT_STORAGE_PATH: &str = "storage.db";
+pub const DEFAULT_SOCKET_PATH: &str = "/tmp/zero-kv.sock";
+
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 // i'm using an explicit u32 discriminant here so the status fits perfectly into
@@ -31,6 +35,12 @@ pub enum EngineError {
     // updated to match your new hardening logic
     #[error("Invalid storage file: Magic number mismatch")]
     MagicMismatch,
+
+    #[error("Invalid storage file: Version mismatch (expected 1, got {0})")]
+    VersionMismatch(u64),
+
+    #[error("Invalid storage file: Index exceeds file bounds")]
+    IndexSizeMismatch,
 
     #[error("Invalid storage file: Header is too small or corrupted")]
     InvalidHeader,
@@ -99,7 +109,7 @@ pub struct Request {
 // every response starts with these 8 bytes. it's the "contract" with
 // the client—telling them if the key exists and how much data follows.
 #[repr(C)]
-#[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone)]
+#[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone, Default)]
 pub struct ResponseHeader {
     pub status: U32, // the status code of the response (e.g., ok, not found).
     pub length: U32, // the length of the data payload that follows the header.

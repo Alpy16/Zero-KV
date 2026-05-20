@@ -25,14 +25,15 @@ async fn main() -> Result<()> {
     let start = Instant::now();
     let mut total_requests = 0;
 
+    // pre-allocate the response buffer outside the loop to keep the hot path allocation-free.
+    let mut response_buf = vec![0u8; 256 * (8 + 19)]; // 8 byte header + "First value content"
+
     // run for 10 seconds or until interrupted
     while start.elapsed().as_secs() < 10 {
         socket.write_all(&batch).await?;
 
         // we expect 256 responses. each response header is 8 bytes.
         // we know key 100 has a value, so we must account for that in the read.
-        // for simplicity in this benchmarker, we just pull the expected byte count.
-        let mut response_buf = vec![0u8; 256 * (8 + 19)]; // 8 byte header + "First value content"
         socket.read_exact(&mut response_buf).await?;
 
         total_requests += 256;

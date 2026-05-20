@@ -2,6 +2,19 @@
 
 All notable changes to the Zero-KV storage engine will be documented in this file. This project adheres to a performance-driven development lifecycle.
 
+## [Stage 7] - Enhanced Error Handling & Configuration Centralization
+
+### Added
+- **Granular Storage Initialization Errors:** Introduced specific error variants (`VersionMismatch`, `IndexSizeMismatch`) for more precise diagnostics during storage file loading.
+- **Protocol Error Status:** Explicitly return `ResponseStatus::Error` for unknown `OpCode`s, improving client-side error handling.
+- **Centralized Configuration Constants:** Moved `DEFAULT_STORAGE_PATH` and `DEFAULT_SOCKET_PATH` to `lib.rs` for easier management and consistency across the project.
+
+### Changed
+- **Storage Validation Logic:** Refined `Storage::new` to perform more robust checks on header magic, version, and index bounds.
+- **Unsafe Block Documentation:** Added explicit `// SAFETY:` comments to justify `unsafe` blocks, improving code clarity and maintainability.
+
+---
+
 ## [Stage 6] - Mechanical Sympathy & Syscall Optimization
 
 ### Added

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use kv_store::{HEADER_SIZE, Header, IndexEntry};
+use kv_store::{DEFAULT_STORAGE_PATH, HEADER_SIZE, Header, IndexEntry};
 use std::fs::File;
 // we bring in `BufWriter` for buffered file I/O, which is more efficient for writing large amounts of data.
 use std::io::{BufWriter, Write};
@@ -54,8 +54,8 @@ fn main() -> Result<()> {
         }
     }
 
-    let file = File::create_new("storage.db")
-        .context("storage.db already exists. delete it before re-baking")?;
+    let file = File::create_new(DEFAULT_STORAGE_PATH)
+        .context("storage file already exists. delete it before re-baking")?;
     let mut writer = BufWriter::new(file);
 
     writer
