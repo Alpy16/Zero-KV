@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     for (key, value) in &raw_data {
         let val_len = value.len() as u32;
         index_entries.push(IndexEntry {
-            key: *key as u64,
+            key: *key,
             val_offset: current_offset,
             val_len,
             _padding: 0,
@@ -71,7 +71,7 @@ fn main() -> Result<()> {
         // to start on an 8-byte boundary. it ensures the cpu can fetch data
         // without splitting a read across cache lines.
         current_offset += val_len as u64;
-        if current_offset % 8 != 0 {
+        if !current_offset.is_multiple_of(8) {
             current_offset += 8 - (current_offset % 8);
         }
     }

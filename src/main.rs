@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
             let mut response_headers = [ResponseHeader::default(); 256];
             let mut data_slices = [None; 256];
 
-            loop {
+            'connection: loop {
                 let n = match socket.read(&mut read_buf[leftover..]).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
@@ -60,7 +60,9 @@ async fn main() -> Result<()> {
 
                 {
                     // to achieve a truly zero-allocation hot path, we use a stack-allocated
-                    // array of IoSlices. 512 slices * 16 bytes is only 8kb—well within stack limits.
+                    // array of IoSlices and a parallel array to track the raw byte slices
+                    // to handle partial writes safely without re-borrowing conflicts.
+                    let mut source_slices: [&[u8]; 512] = [&[]; 512];
                     let mut response_slices = [IoSlice::new(&[]); 512];
                     let mut current_slice_count = 0;
                     let mut current_response_count = 0;
@@ -68,7 +70,7 @@ async fn main() -> Result<()> {
                     // we process every 16-byte frame in our current batch.
                     // by doing lookups in a tight loop, we keep the cpu's
                     // instruction cache very happy.
-                    while total_bytes - consumed >= 16 {
+                    while total_bytes - consumed >= 16 && current_response_count < 256 {
                         let frame = &read_buf[consumed..consumed + 16];
                         consumed += 16;
 
@@ -112,22 +114,41 @@ async fn main() -> Result<()> {
 
                     // vectored i/o is how i avoid the "final copy."
                     for i in 0..current_response_count {
-                        response_slices[current_slice_count] =
-                            IoSlice::new(response_headers[i].as_bytes());
+                        let header_bytes = response_headers[i].as_bytes();
+                        source_slices[current_slice_count] = header_bytes;
+                        response_slices[current_slice_count] = IoSlice::new(header_bytes);
                         current_slice_count += 1;
                         if let Some(data) = data_slices[i] {
+                            source_slices[current_slice_count] = data;
                             response_slices[current_slice_count] = IoSlice::new(data);
                             current_slice_count += 1;
                         }
                     }
 
                     if current_slice_count > 0 {
-                        if socket
-                            .write_vectored(&response_slices[..current_slice_count])
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        let mut current_idx = 0;
+                        while current_idx < current_slice_count {
+                            match socket
+                                .write_vectored(&response_slices[current_idx..current_slice_count])
+                                .await
+                            {
+                                Ok(0) | Err(_) => break 'connection,
+                                Ok(n) => {
+                                    let mut remaining = n;
+                                    while remaining > 0 && current_idx < current_slice_count {
+                                        if source_slices[current_idx].len() <= remaining {
+                                            remaining -= source_slices[current_idx].len();
+                                            current_idx += 1;
+                                        } else {
+                                            source_slices[current_idx] =
+                                                &source_slices[current_idx][remaining..];
+                                            response_slices[current_idx] =
+                                                IoSlice::new(source_slices[current_idx]);
+                                            remaining = 0;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

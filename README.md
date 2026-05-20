@@ -8,7 +8,7 @@
 
 Zero-KV is a disk-backed, read-optimized key-value storage engine for low-latency local environments.
 
-The project explores systems-level performance techniques in Rust: immutable binary storage, memory-mapped reads, fixed-width request frames, Unix Domain Sockets, batched request handling, and vectored writes.
+The project explores systems-level performance techniques in Rust: immutable binary storage, memory-mapped reads, fixed-width binary frames, Unix Domain Sockets, batched request handling, and vectored writes.
 
 The engine is intentionally scoped around a simple workload: fast local lookups from a pre-baked immutable dataset.
 
@@ -18,8 +18,10 @@ The engine is intentionally scoped around a simple workload: fast local lookups 
 * **Fixed binary protocol:** Uses 16-byte request frames and 8-byte response headers for predictable parsing.
 * **Unix Domain Socket transport:** Uses UDS for local inter-process communication without TCP loopback overhead.
 * **Sorted immutable index:** Stores fixed-width index entries and performs binary search over the mapped index region.
+* **Input-driven baking:** Compiles a simple `key,value` input file into an immutable binary `storage.db`.
 * **Batched request handling:** Reads 4KB request batches and processes up to 256 pipelined requests per batch.
 * **Vectored responses:** Uses `write_vectored` to write response headers and value slices without assembling a separate contiguous response buffer.
+* **Partial-write safety:** Handles partial vectored writes by advancing through written slices until the full response batch is flushed.
 * **Cache-conscious layout:** Aligns stored value regions to 8-byte boundaries to simplify offset calculation and reduce unaligned access concerns.
 * **Reusable hot-path buffers:** Reuses stack-allocated response metadata inside the server loop to reduce allocator pressure during steady-state handling.
 
@@ -41,33 +43,9 @@ cd Zero-KV
 cargo build --release
 ```
 
-### Environment Setup
+### Generate a Dataset
 
-Generate a benchmark input dataset:
-
-```
-seq 1 100000 | awk '{print $1 ",value_content_at_key_" $1}' > bench_input.csv
-```
-
-Bake the immutable storage file:
-
-```
-cargo run --release --bin baker -- bench_input.csv
-```
-
-This creates `storage.db`, which is loaded by the server at startup.
-
-## Usage
-
-### Build
-
-```
-cargo build --release
-```
-
-### Bake Dataset
-
-Input format:
+Zero-KV expects a simple CSV-like input file:
 
 ```
 key,value
@@ -81,13 +59,29 @@ Example:
 100,First value content
 ```
 
-Bake it:
+Generate a 100,000-entry benchmark dataset:
+
+```
+seq 1 100000 | awk '{print $1 ",value_content_at_key_" $1}' > bench_input.csv
+```
+
+### Bake the Storage File
+
+Compile the input dataset into an immutable binary database:
 
 ```
 cargo run --release --bin baker -- bench_input.csv
 ```
 
-### Run Server
+This creates:
+
+```
+storage.db
+```
+
+The server loads this file at startup.
+
+### Run the Server
 
 ```
 RUST_LOG=error cargo run --release --bin kv_store
@@ -99,7 +93,7 @@ By default, the server listens on:
 /tmp/zero-kv.sock
 ```
 
-### Run Benchmark
+### Run the Benchmark
 
 In another terminal:
 
@@ -109,29 +103,31 @@ cargo run --release --bin benchmarker
 
 The benchmarker launches 100 concurrent Unix socket clients, each sending 256-request pipelines against keys in the baked dataset.
 
-### Full Lifecycle Script
+## Full Lifecycle Script
 
-If using the automation script:
+The repository includes `cycle.sh`, which runs the full build, bake, serve, and benchmark cycle.
 
 ```
-chmod +x run.sh
-./run.sh
+chmod +x cycle.sh
+./cycle.sh
 ```
 
-The script performs the full cycle:
+The script performs the following steps:
 
-1. Build release binaries
-2. Generate a 100,000-entry dataset
-3. Bake `storage.db`
-4. Start the server
-5. Run the saturation benchmark
-6. Clean up temporary input files
+1. Builds release binaries
+2. Generates a 100,000-entry dataset
+3. Bakes `storage.db`
+4. Starts the server in the background
+5. Waits for the Unix socket to become available
+6. Runs the saturation benchmark
+7. Checks that the server survived the benchmark
+8. Cleans up temporary input files
 
 ## Performance Metrics
 
-The current benchmark is designed to measure saturated local read throughput under pipelined Unix Domain Socket traffic.
+The benchmark is designed to measure saturated local read throughput under pipelined Unix Domain Socket traffic.
 
-Example benchmark configuration:
+Latest benchmark configuration:
 
 | Parameter          |                      Value |
 | ------------------ | -------------------------: |
@@ -142,17 +138,20 @@ Example benchmark configuration:
 | Transport          |        Unix Domain Sockets |
 | Storage mode       | Immutable mmap-backed file |
 | Workload           |         Existing-key reads |
+| Hit rate           |                       100% |
 
-Example result from WSL2:
+Latest observed result:
 
-| Metric            |                 Result |
-| ----------------- | ---------------------: |
-| Throughput        | 3,681,180 requests/sec |
-| Batch P50 latency |                22.30µs |
-| Batch P99 latency |                66.30µs |
-| Max batch spike   |                90.62µs |
+| Metric            |                  Result |
+| ----------------- | ----------------------: |
+| Throughput        | 10,405,284 requests/sec |
+| Batch P50 latency |                 2.387ms |
+| Batch P99 latency |                 5.413ms |
+| Total requests    |             104,117,504 |
 
 Latency values represent completion time for a full 256-request pipeline, not individual request latency.
+
+Benchmark results are environment-dependent. The result above was collected in a local Linux/WSL2 environment using Unix Domain Sockets.
 
 ## Performance Telemetry
 
@@ -171,10 +170,10 @@ Zero-KV
 │   ├── storage.rs          # Mmap-backed storage engine and index lookup
 │   ├── main.rs             # UDS server and request handling loop
 │   └── bin/
-│       ├── baker.rs        # Dataset compiler: CSV -> immutable storage.db
+│       ├── baker.rs        # Dataset compiler: input file -> immutable storage.db
 │       └── benchmarker.rs  # Saturation benchmark client
 ├── Cargo.toml
-├── run.sh                  # Build, bake, serve, benchmark lifecycle script
+├── cycle.sh                # Build, bake, serve, benchmark lifecycle script
 └── README.md
 ```
 
@@ -220,12 +219,27 @@ padding: u32
 key:     u64
 ```
 
+Supported operations:
+
+| Opcode | Operation |
+| -----: | --------- |
+|      0 | Get       |
+|      1 | Exists    |
+
 Each response begins with an 8-byte header:
 
 ```
 status: u32
 length: u32
 ```
+
+Response statuses:
+
+| Status | Meaning   |
+| -----: | --------- |
+|      0 | Ok        |
+|      1 | Not found |
+|      2 | Error     |
 
 If `length > 0`, the response header is followed by the value bytes.
 
@@ -271,11 +285,21 @@ If `length > 0`, the response header is followed by the value bytes.
 
 **Consequence:** Syscall cost is amortized across many pipelined requests.
 
+### ADR 6: Partial-Write-Safe Vectored Output
+
+**Context:** A single vectored write is not guaranteed to flush every byte in the provided slice list.
+
+**Decision:** Track the number of bytes written, advance through completed slices, trim partially written slices, and continue writing until the full response batch is sent.
+
+**Consequence:** The server preserves response framing correctness while keeping the zero-copy response path.
+
 ## Safety Notes
 
 The storage engine uses a raw pointer internally to reference the mapped index region.
 
-This is done to avoid self-referential lifetime issues while allowing the read-only storage object to be shared across worker tasks. The pointer is derived from the owned mmap, the mmap length is validated before pointer construction, and the mapped file is never mutated by the engine after startup.
+This avoids self-referential lifetime issues while allowing the read-only storage object to be shared across worker tasks. The pointer is derived from the owned mmap, the mmap length is validated before pointer construction, and the mapped file is never mutated by the engine after startup.
+
+The server response path uses borrowed slices into preallocated response headers and mmap-backed values. Vectored writes are advanced carefully so partial writes do not corrupt the client-visible response stream.
 
 ## Limitations
 
@@ -285,7 +309,8 @@ This is done to avoid self-referential lifetime issues while allowing the read-o
 * Local IPC only through Unix Domain Sockets
 * Benchmark is optimized for local saturated read throughput
 * Batch latency is reported per 256-request pipeline, not per individual request
-* Current input format is simple CSV and does not support escaping commas inside values
+* Current input format is simple CSV-like `key,value` and does not support escaping commas inside values
+* Benchmark workload currently measures 100% existing-key reads
 
 ## License
 
