@@ -2,18 +2,40 @@ use anyhow::{Context, Result};
 use kv_store::{DEFAULT_STORAGE_PATH, HEADER_SIZE, Header, IndexEntry};
 use std::fs::File;
 // we bring in `BufWriter` for buffered file I/O, which is more efficient for writing large amounts of data.
+use std::env;
+use std::fs;
 use std::io::{BufWriter, Write};
 use zerocopy::AsBytes; // we use this to turn structs into bytes safely
 
 fn main() -> Result<()> {
-    // i think of the baker as our "ahead-of-time" optimizer. if i sort
-    // and align everything here, the server doesn't have to waste a
-    // single cpu cycle on logic when a request hits.
-    let mut raw_data = vec![
-        (100, b"First value content".to_vec()),
-        (50, b"Second".to_vec()),
-        (200, b"Third and longest value here".to_vec()),
-    ];
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        anyhow::bail!("Usage: baker <input_file>\nFormat: key,value (one per line)");
+    }
+
+    let input_path = &args[1];
+    let content = fs::read_to_string(input_path)
+        .with_context(|| format!("failed to read input file: {}", input_path))?;
+
+    let mut raw_data = Vec::new();
+    for (idx, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some((k_str, v_str)) = line.split_once(',') {
+            let key = k_str
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("invalid key on line {}: {}", idx + 1, k_str))?;
+            raw_data.push((key, v_str.trim().as_bytes().to_vec()));
+        } else {
+            eprintln!("Warning: Skipping malformed line {}: {}", idx + 1, line);
+        }
+    }
+
+    if raw_data.is_empty() {
+        anyhow::bail!("No valid entries found in input file.");
+    }
 
     // sorting is non-negotiable; binary search needs order.
     raw_data.sort_by_key(|item| item.0);
