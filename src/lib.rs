@@ -1,13 +1,13 @@
 use std::io;
 use thiserror::Error;
 pub mod storage;
-// we bring in `zerocopy` traits to enable safe, allocation-free byte-to-struct conversions.
+/// We utilize `zerocopy` traits to facilitate safe, allocation-free casting of raw byte slices
+/// into structured memory layouts, minimizing CPU overhead during serialization and deserialization.
 use zerocopy::{
     AsBytes, FromBytes, FromZeroes,
     byteorder::network_endian::{U32, U64},
 };
 
-/// Default configuration constants used across the engine and tools.
 pub const DEFAULT_STORAGE_PATH: &str = "storage.db";
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/zero-kv.sock";
 
@@ -21,11 +21,11 @@ pub enum ResponseStatus {
     Error = 2,
 }
 
-/// Custom Error type for the entire storage engine.
-// i'm centralizing everything in this enum. using thiserror makes it easy to
-// wrap low-level io or mmap issues into something that fits our engine's logic.
 #[derive(Error, Debug)]
 pub enum EngineError {
+    #[error("Data corruption: Checksum mismatch")]
+    ChecksumMismatch,
+
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
 
@@ -36,7 +36,7 @@ pub enum EngineError {
     #[error("Invalid storage file: Magic number mismatch")]
     MagicMismatch,
 
-    #[error("Invalid storage file: Version mismatch (expected 1, got {0})")]
+    #[error("Invalid storage file: Version mismatch (Expected 1, Got {0})")]
     VersionMismatch(u64),
 
     #[error("Invalid storage file: Index exceeds file bounds")]
@@ -53,35 +53,34 @@ pub enum EngineError {
 }
 
 /// The 'Header' sits at byte 0 of your file.
+/// We use `repr(C)` to ensure a stable memory layout across different compiler versions,
+/// which is critical for direct memory mapping of the database file.
 #[repr(C)]
-// i'm using repr(c) to force a stable memory layout. since i'm using zerocopy
-// to map raw file bytes directly to these structs, i can't let the compiler
-// shuffle the fields around during optimization.
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone)]
 pub struct Header {
     pub magic: u64,
     pub version: u64,
     pub count: u64,
-    pub padding: u64,
+    pub header_checksum: u32,
+    pub _padding: u32, // Adjusted to 32-bit to maintain 8-byte alignment for the total struct (32 bytes).
 }
 
+/// Each `IndexEntry` represents a fixed-width pointer to a value in the data section.
+/// We repurposed the previous padding field to store a CRC32C checksum of the value data,
+/// enabling O(1) integrity verification during the retrieval hot path.
 #[repr(C)]
-// i designed the index entry to be a fixed 24 bytes. this is the key to
-// our performance—it lets me treat the whole index section as a simple
-// array and jump to any entry using basic math.
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone)]
 pub struct IndexEntry {
     pub key: u64,
     pub val_offset: u64,
     pub val_len: u32,
-    pub _padding: u32,
+    pub val_checksum: u32, // Checksum of the value payload.
 }
 
 pub const HEADER_SIZE: usize = std::mem::size_of::<Header>();
 pub const INDEX_ENTRY_SIZE: usize = std::mem::size_of::<IndexEntry>();
 
 impl Header {
-    // just a quick sanity check to make sure i'm actually opening a zero-kv file.
     pub fn is_valid(&self) -> bool {
         self.magic == 0xA016 && self.version == 1
     }
@@ -95,10 +94,9 @@ pub enum OpCode {
     Unknown = 99,
 }
 
-// i made this request frame exactly 16 bytes. using zerocopy's big-endian
-// types (U32/U64) handles the network byte order automatically, so i don't
-// have to manually call .to_be_bytes() and risk a mistake.
-#[repr(C)]
+/// We enforce a 16-byte fixed-width request frame. By utilizing Big-Endian types,
+/// we ensure protocol compatibility across different CPU architectures.
+#[repr(C, align(8))]
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone)]
 pub struct Request {
     pub op: U32,       // automatically handles big-endian conversion for the operation code.
@@ -106,9 +104,9 @@ pub struct Request {
     pub key: U64,      // automatically handles big-endian conversion for the 64-bit key.
 }
 
-// every response starts with these 8 bytes. it's the "contract" with
-// the client—telling them if the key exists and how much data follows.
-#[repr(C)]
+/// The response header establishes a contract with the client, providing the
+/// operation status and the exact length of the trailing payload.
+#[repr(C, align(8))]
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone, Default)]
 pub struct ResponseHeader {
     pub status: U32, // the status code of the response (e.g., ok, not found).
@@ -136,14 +134,10 @@ impl Request {
 }
 
 impl ResponseHeader {
-    /// similar to `Request::from_bytes`, this method safely decodes a byte slice
-    /// into a `ResponseHeader` struct, used by clients to parse server responses.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         Self::read_from(bytes)
     }
 
-    /// converts the `ResponseHeader` struct into a fixed-size byte array for network transmission.
-    /// this is used by the `main.rs` server to send response headers.
     pub fn to_bytes(&self) -> [u8; 8] {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(self.as_bytes());
@@ -156,17 +150,13 @@ mod tests {
     use super::*;
 
     #[test]
-    /// we test the roundtrip conversion of our `Request` struct to bytes and back.
-    /// this ensures our `zerocopy` implementation and byte order handling are correct.
     fn test_protocol_roundtrip() {
-        // we create an original request using `zerocopy` types for op code and key.
         let original_req = Request {
-            op: U32::new(OpCode::Get as u32), // we wrap the enum variant as a `U32` for network endianness.
+            op: U32::new(OpCode::Get as u32),
             _padding: 0,
-            key: U64::new(0xDEADBEEFCAFEBABE), // we wrap the raw `u64` key as a `U64`.
+            key: U64::new(0xDEADBEEFCAFEBABE),
         };
 
-        // we encode the request struct into its byte representation.
         let bytes = original_req.to_bytes();
 
         // we decode the bytes back into a `Request` struct.

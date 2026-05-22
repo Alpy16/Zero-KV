@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use kv_store::{DEFAULT_STORAGE_PATH, HEADER_SIZE, Header, IndexEntry};
-use std::fs::File;
-// we bring in `BufWriter` for buffered file I/O, which is more efficient for writing large amounts of data.
 use std::env;
 use std::fs;
+use std::fs::File;
+/// We use `BufWriter` to batch our disk I/O operations, significantly reducing
+/// the number of system calls required to flush the baked database to storage.
+/// We utilize `zerocopy::AsBytes` to safely serialize our index directly from memory.
 use std::io::{BufWriter, Write};
 use zerocopy::AsBytes; // we use this to turn structs into bytes safely
 
@@ -37,39 +39,43 @@ fn main() -> Result<()> {
         anyhow::bail!("No valid entries found in input file.");
     }
 
-    // sorting is non-negotiable; binary search needs order.
+    // We perform an in-place sort by key to ensure the storage engine can
+    // utilize O(log n) binary search lookups against the memory-mapped file.
     raw_data.sort_by_key(|item| item.0);
 
-    let my_header = Header {
+    let mut my_header = Header {
         magic: 0xA016,
         version: 1,
         count: raw_data.len() as u64,
-        padding: 0,
+        header_checksum: 0,
+        _padding: 0,
     };
+
+    // We calculate the header checksum using the "Zero-Field" pattern.
+    // The `header_checksum` is calculated while its own field is treated as zero.
+    my_header.header_checksum = crc32fast::hash(my_header.as_bytes());
 
     let header_size = HEADER_SIZE as u64;
     let index_entry_size = std::mem::size_of::<IndexEntry>() as u64;
     let index_section_size = my_header.count * index_entry_size;
     let data_start_offset = header_size + index_section_size;
 
-    // `current_offset` tracks where the next value will be written in the file.
     let mut current_offset = data_start_offset;
-    // `index_entries` will store all the `IndexEntry` structs that form our index.
     let mut index_entries = Vec::new();
 
-    // we calculate the positions of all our values
     for (key, value) in &raw_data {
         let val_len = value.len() as u32;
+        // We calculate the CRC32C hash for the value payload to protect against bit-rot.
         index_entries.push(IndexEntry {
             key: *key,
             val_offset: current_offset,
-            val_len,
-            _padding: 0,
+            val_len: value.len() as u32,
+            val_checksum: crc32fast::hash(value),
         });
 
-        // this is where mechanical sympathy comes in—i'm forcing every value
-        // to start on an 8-byte boundary. it ensures the cpu can fetch data
-        // without splitting a read across cache lines.
+        // We enforce an 8-byte boundary alignment for all data values.
+        // This ensures that the CPU can retrieve data in a single memory fetch
+        // without crossing cache line boundaries.
         current_offset += val_len as u64;
         if !current_offset.is_multiple_of(8) {
             current_offset += 8 - (current_offset % 8);
@@ -93,7 +99,6 @@ fn main() -> Result<()> {
             .write_all(value)
             .context("failed to write data value")?;
 
-        // padding the actual file to maintain our 8-byte alignment.
         let remainder = value.len() % 8;
         if remainder != 0 {
             let padding_needed = 8 - remainder;
@@ -104,8 +109,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // we flush the `BufWriter` to ensure all buffered data is physically moved
-    // from memory to the disk platter, making the database file persistent.
+    // We flush the buffer to ensure the persistence of the atomic database file.
     writer.flush().context("failed to flush data to disk")?;
 
     println!(

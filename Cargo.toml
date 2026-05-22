@@ -22,3 +22,5 @@ bytes = "1.5"
 # observability (making it look professional)
 tracing = "0.1"
 tracing-subscriber = "0.3"
+crc32c = "0.6.8"
+crc32fast = "1.5.0"
