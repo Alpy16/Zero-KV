@@ -11,8 +11,10 @@ use zerocopy::{
 pub const DEFAULT_STORAGE_PATH: &str = "storage.db";
 pub const DEFAULT_SOCKET_PATH: &str = "/tmp/zero-kv.sock";
 
+/// `ResponseStatus` defines the machine-readable outcome of a request.
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+// We use an explicit u32 discriminant to ensure the status fits perfectly into
 // i'm using an explicit u32 discriminant here so the status fits perfectly into
 // our 8-byte response header without any padding or alignment surprises.
 pub enum ResponseStatus {
@@ -21,6 +23,9 @@ pub enum ResponseStatus {
     Error = 2,
 }
 
+/// `EngineError` represents all possible failure modes during storage initialization
+/// or runtime request processing. This uses `thiserror` to provide descriptive
+/// error messages while maintaining compatibility with `anyhow`.
 #[derive(Error, Debug)]
 pub enum EngineError {
     #[error("Data corruption: Checksum mismatch")]
@@ -32,7 +37,6 @@ pub enum EngineError {
     #[error("File collision: {0}")]
     FileCollision(String),
 
-    // updated to match your new hardening logic
     #[error("Invalid storage file: Magic number mismatch")]
     MagicMismatch,
 
@@ -66,7 +70,9 @@ pub struct Header {
 }
 
 /// Each `IndexEntry` represents a fixed-width pointer to a value in the data section.
-/// We repurposed the previous padding field to store a CRC32C checksum of the value data,
+/// These entries are stored in a contiguous array within the storage file, sorted by key.
+/// This layout allows the engine to locate any value using a binary search over the
+/// memory-mapped index section. We use the `val_checksum` field to store a CRC32C
 /// enabling O(1) integrity verification during the retrieval hot path.
 #[repr(C)]
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone)]
@@ -77,15 +83,19 @@ pub struct IndexEntry {
     pub val_checksum: u32, // Checksum of the value payload.
 }
 
+/// Fixed sizes derived from the struct layouts to assist in offset calculations.
 pub const HEADER_SIZE: usize = std::mem::size_of::<Header>();
 pub const INDEX_ENTRY_SIZE: usize = std::mem::size_of::<IndexEntry>();
 
 impl Header {
+    /// Per-flight check to ensure the file being loaded matches the engine's expectations.
     pub fn is_valid(&self) -> bool {
         self.magic == 0xA016 && self.version == 1
     }
 }
 
+/// `OpCode` identifies the specific operation requested by the client.
+/// We limit these to 32-bit values to maintain alignment in the `Request` frame.
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum OpCode {
@@ -96,6 +106,9 @@ pub enum OpCode {
 
 /// We enforce a 16-byte fixed-width request frame. By utilizing Big-Endian types,
 /// we ensure protocol compatibility across different CPU architectures.
+/// Alignment is set to 8 to ensure the `key` (U64) is naturally aligned,
+/// which prevents unaligned access penalties on certain architectures and
+/// simplifies direct memory casting.
 #[repr(C, align(8))]
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone)]
 pub struct Request {
@@ -106,6 +119,9 @@ pub struct Request {
 
 /// The response header establishes a contract with the client, providing the
 /// operation status and the exact length of the trailing payload.
+/// This header is designed to be small (8 bytes) so it can be sent
+/// in the same packet as the data payload during vectored writes,
+/// minimizing network fragmentation.
 #[repr(C, align(8))]
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone, Default)]
 pub struct ResponseHeader {
@@ -114,6 +130,8 @@ pub struct ResponseHeader {
 }
 
 impl Request {
+    /// Safely attempts to interpret a raw byte slice as a `Request` frame.
+    /// Returns `None` if the slice length is insufficient or alignment is invalid.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         Self::read_from(bytes)
     }
@@ -124,6 +142,7 @@ impl Request {
         buf
     }
 
+    /// Converts the raw numeric operation code into a typed `OpCode`.
     pub fn opcode(&self) -> OpCode {
         match self.op.get() {
             0 => OpCode::Get,

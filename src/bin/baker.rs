@@ -76,6 +76,9 @@ fn main() -> Result<()> {
         // We enforce an 8-byte boundary alignment for all data values.
         // This ensures that the CPU can retrieve data in a single memory fetch
         // without crossing cache line boundaries.
+        // Aligning offsets during the bake phase is a one-time cost that
+        // eliminates the need for expensive unaligned-load handling
+        // or data-copying during the server's runtime.
         current_offset += val_len as u64;
         if !current_offset.is_multiple_of(8) {
             current_offset += 8 - (current_offset % 8);
