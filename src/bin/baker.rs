@@ -3,11 +3,8 @@ use kv_store::{DEFAULT_STORAGE_PATH, HEADER_SIZE, Header, IndexEntry};
 use std::env;
 use std::fs;
 use std::fs::File;
-/// We use `BufWriter` to batch our disk I/O operations, significantly reducing
-/// the number of system calls required to flush the baked database to storage.
-/// We utilize `zerocopy::AsBytes` to safely serialize our index directly from memory.
 use std::io::{BufWriter, Write};
-use zerocopy::AsBytes; // we use this to turn structs into bytes safely
+use zerocopy::AsBytes;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -39,8 +36,7 @@ fn main() -> Result<()> {
         anyhow::bail!("No valid entries found in input file.");
     }
 
-    // We perform an in-place sort by key to ensure the storage engine can
-    // utilize O(log n) binary search lookups against the memory-mapped file.
+    // Sort the index by key for binary search.
     raw_data.sort_by_key(|item| item.0);
 
     let mut my_header = Header {
@@ -51,8 +47,7 @@ fn main() -> Result<()> {
         _padding: 0,
     };
 
-    // We calculate the header checksum using the "Zero-Field" pattern.
-    // The `header_checksum` is calculated while its own field is treated as zero.
+    // Hash the header with its checksum field set to zero.
     my_header.header_checksum = crc32fast::hash(my_header.as_bytes());
 
     let header_size = HEADER_SIZE as u64;
@@ -65,7 +60,7 @@ fn main() -> Result<()> {
 
     for (key, value) in &raw_data {
         let val_len = value.len() as u32;
-        // We calculate the CRC32C hash for the value payload to protect against bit-rot.
+        // Store the payload CRC32 for verification during lookup.
         index_entries.push(IndexEntry {
             key: *key,
             val_offset: current_offset,
@@ -73,12 +68,7 @@ fn main() -> Result<()> {
             val_checksum: crc32fast::hash(value),
         });
 
-        // We enforce an 8-byte boundary alignment for all data values.
-        // This ensures that the CPU can retrieve data in a single memory fetch
-        // without crossing cache line boundaries.
-        // Aligning offsets during the bake phase is a one-time cost that
-        // eliminates the need for expensive unaligned-load handling
-        // or data-copying during the server's runtime.
+        // Pad each value so the next value starts on an 8-byte boundary.
         current_offset += val_len as u64;
         if !current_offset.is_multiple_of(8) {
             current_offset += 8 - (current_offset % 8);
@@ -112,7 +102,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // We flush the buffer to ensure the persistence of the atomic database file.
+    // Flush buffered bytes to the file; this does not call fsync or publish atomically.
     writer.flush().context("failed to flush data to disk")?;
 
     println!(

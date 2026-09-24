@@ -10,7 +10,7 @@ const CONCURRENT_CONNECTIONS: usize = 100;
 const PIPELINE_DEPTH: usize = 256;
 const RUN_DURATION: u64 = 10;
 const MAX_KEY: u64 = 100_000;
-const MAX_LATENCY_SAMPLES: usize = 10_000; // per connection to avoid memory bloat
+const MAX_LATENCY_SAMPLES: usize = 10_000; // Maximum recorded batches per connection.
 
 async fn run_client(task_id: usize) -> Result<(u64, Vec<Duration>)> {
     let mut socket = UnixStream::connect(DEFAULT_SOCKET_PATH).await?;
@@ -24,14 +24,13 @@ async fn run_client(task_id: usize) -> Result<(u64, Vec<Duration>)> {
     let mut seed = (task_id as u64 + 42) * 1103515245;
     let mut next_key = || {
         seed = (seed.wrapping_mul(1103515245).wrapping_add(12345)) & 0x7fffffff;
-        // Samples from 1..MAX_KEY. Given our dataset is 1..100,000,
-        // this simulates a 100% hit-rate scenario.
+        // Sample 1..=MAX_KEY; all keys exist in the generated benchmark dataset.
         1 + (seed % MAX_KEY)
     };
 
     let start = Instant::now();
     let mut header_buf = [0u8; 8];
-    let mut val_scratch = Vec::with_capacity(1024); // Dynamically resized to avoid panics
+    let mut val_scratch = Vec::with_capacity(1024); // Grows to fit the largest response seen.
 
     while start.elapsed().as_secs() < RUN_DURATION {
         batch_buf.clear();
@@ -47,7 +46,7 @@ async fn run_client(task_id: usize) -> Result<(u64, Vec<Duration>)> {
         let batch_start = Instant::now();
         socket.write_all(&batch_buf).await?;
 
-        // Correctly handle variable value lengths by reading headers first
+        // Read each header before its variable-length payload.
         for _ in 0..PIPELINE_DEPTH {
             socket.read_exact(&mut header_buf).await?;
             let h = ResponseHeader::from_bytes(&header_buf)
@@ -90,10 +89,9 @@ async fn main() -> Result<()> {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
-    all_latencies.sort_unstable(); // Faster sort for Duration types
+    all_latencies.sort_unstable();
 
-    // Note: Latency reported is for a BATCH of 256 requests.
-    // This is the true measurement of the "Syscall Amortization" effectiveness.
+    // Percentiles cover recorded batch completion times, capped per connection.
     let p50 = all_latencies[all_latencies.len() / 2];
     let p99 = all_latencies[(all_latencies.len() * 99) / 100];
 

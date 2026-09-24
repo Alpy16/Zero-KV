@@ -9,17 +9,17 @@ lto = "fat"
 codegen-units = 1
 
 [dependencies]
-# our core engine tools
+# Storage and error handling
 memmap2 = "0.9"
 zerocopy = { version = "0.7", features = ["derive"] }
 thiserror = "1.0"
 anyhow = "1.0"
 
-# the networking stack (Stage 4)
+# Networking
 tokio = { version = "1", features = ["full"] }
 bytes = "1.5"
 
-# observability (making it look professional)
+# Logging and checksums
 tracing = "0.1"
 tracing-subscriber = "0.3"
 crc32c = "0.6.8"

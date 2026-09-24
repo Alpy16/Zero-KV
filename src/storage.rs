@@ -3,32 +3,27 @@ use anyhow::Result;
 use memmap2::{Advice, Mmap};
 use zerocopy::{AsBytes, FromBytes};
 
-/// We leverage Memory-Mapped I/O (Mmap) to treat the database file as an addressable
-/// byte array in memory. This delegates page cache management to the kernel,
-/// enabling zero-copy lookups and maximizing I/O throughput.
+/// Read-only mapped storage with borrowed value slices.
 pub struct Storage {
     pub object: Mmap,
     pub header: Header,
-    /// We utilize a raw pointer for the index section to satisfy Send/Sync requirements
-    /// within an Arc. The safety of this pointer is guaranteed by the lifetime of the
-    /// owned Mmap object.
+    /// Points into `object`, avoiding a self-referential slice field.
+    /// Validity requires keeping the mapping and index count unchanged.
     index_ptr: *const IndexEntry,
 }
 
 impl Storage {
     pub fn new(path: &str) -> Result<Self, EngineError> {
-        // We open the file in read-only mode as the engine is designed for immutable datasets.
+        // Open the immutable dataset read-only.
         let file = std::fs::File::open(path).map_err(EngineError::Io)?;
 
-        // We map the entire file into the process's address space.
-        // SAFETY: The file is not modified while mapped, satisfying Mmap requirements.
+        // SAFETY: The caller must ensure the file is not modified or truncated while mapped.
         let mmap = unsafe { Mmap::map(&file).map_err(|e| EngineError::MmapFailed(e.to_string()))? };
 
-        // We disable sequential pre-fetching hints because binary search patterns
-        // trigger random access, making standard read-ahead logic counterproductive.
+        // Hint that binary searches access the mapping non-sequentially.
         let _ = mmap.advise(Advice::Random);
 
-        // Ensure the file is at least large enough to contain our fixed-size header.
+        // Ensure the file is at least large enough to contain the fixed-size header.
         if mmap.len() < HEADER_SIZE {
             return Err(EngineError::InvalidHeader);
         }
@@ -42,8 +37,7 @@ impl Storage {
             return Err(EngineError::VersionMismatch(header.version));
         }
 
-        // We verify the header checksum using the "Zero-Field" technique.
-        // We calculate the hash of the header struct while its own checksum field is set to zero.
+        // Verify CRC32 with the header checksum field set to zero.
         let mut header_copy = header;
         let stored_checksum = header_copy.header_checksum;
         header_copy.header_checksum = 0;
@@ -59,9 +53,7 @@ impl Storage {
             return Err(EngineError::IndexSizeMismatch);
         }
 
-        // We derive a raw pointer to the start of the index section (immediately following the header).
-        // This allows us to create slices on-demand in the hot path without ownership
-        // complexity inside the Arc-wrapped Storage object.
+        // SAFETY: HEADER_SIZE is within the mapping after the header length check.
         let index_ptr = unsafe { mmap.as_ptr().add(HEADER_SIZE) as *const IndexEntry };
         Ok(Storage {
             object: mmap,
@@ -73,16 +65,13 @@ impl Storage {
     #[inline(always)]
     /// Provides a safe slice view of the sorted index.
     fn index(&self) -> &[IndexEntry] {
-        // SAFETY: The pointer validity was established at creation by checking the Mmap length.
-        // Since the Mmap is read-only and immutable for the lifetime of the Storage struct,
-        // this pointer remains valid for as long as 'self' exists.
-        // The slice is backed by the Mmap object which is owned by this Storage instance.
+        // SAFETY: Requires an aligned index within the owned mapping, with the mapping
+        // and header count unchanged since construction and no external file mutation.
         unsafe { std::slice::from_raw_parts(self.index_ptr, self.header.count as usize) }
     }
 
-    /// Performs a high-speed lookup of a key.
-    /// This involves a binary search over the mmap index, followed by a direct
-    /// reference to the value data in the mmap.
+    /// Finds a key by binary search and verifies the value CRC32 before borrowing it.
+    /// Cost is O(log n + value length) for a hit.
     pub fn get(&self, key: u64) -> Result<Option<&[u8]>, EngineError> {
         let index = self.index();
         // Binary search is O(log N) and takes advantage of the sorted index section.
@@ -101,7 +90,7 @@ impl Storage {
         }
 
         let data = &self.object[start..end];
-        // We verify the payload checksum on the read path to detect storage bit-rot.
+        // Verify the payload CRC32 before returning the borrowed bytes.
         if crc32fast::hash(data) != entry.val_checksum {
             return Err(EngineError::ChecksumMismatch);
         }
@@ -115,7 +104,6 @@ unsafe impl Sync for Storage {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    // we bring in `Header` and `IndexEntry` from `lib.rs` for testing purposes.
     use crate::{Header, IndexEntry};
     use std::fs;
     use zerocopy::AsBytes;
@@ -124,7 +112,7 @@ mod tests {
     fn test_basic_retrieval() -> Result<(), Box<dyn std::error::Error>> {
         let path = "test_engine.db";
         let mut file_content = Vec::new();
-        // we manually construct a header and an index entry to simulate a baked file.
+        // Construct a one-entry storage file.
 
         let mut header = Header {
             magic: 0xA016,
@@ -145,13 +133,10 @@ mod tests {
         file_content.extend_from_slice(header.as_bytes());
         file_content.extend_from_slice(entry.as_bytes());
 
-        // we append the actual value data.
         file_content.extend_from_slice(b"hello");
-        // we write the simulated database file to disk.
         fs::write(path, file_content)?;
 
         let storage = Storage::new(path)?;
-        // we attempt to retrieve the key we just wrote.
         let result = storage.get(42)?;
 
         assert!(result.is_some());

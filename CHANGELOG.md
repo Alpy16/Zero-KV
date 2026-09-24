@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the Zero-KV storage engine will be documented in this file. This project adheres to a performance-driven development lifecycle.
+Development milestones for the Zero-KV storage engine.
 
 ## [Stage 7] - Enhanced Error Handling & Configuration Centralization
 
@@ -36,8 +36,8 @@ All notable changes to the Zero-KV storage engine will be documented in this fil
 ## [Stage 5] - Zero-Copy Path
 
 ### Added
-- **Vectored I/O:** Initial implementation of `write_vectored` for atomic transmission of non-contiguous memory (stack headers and mmap values).
-- **Smoke Tests:** Introduced `smoke_test.rs` for protocol compliance and boundary condition verification.
+- **Vectored I/O:** Initial implementation of `write_vectored` to send non-contiguous response headers and mmap values without an intermediate contiguous buffer.
+- **Smoke Tests:** Introduced `smoke_test.rs` for successful lookups and missing keys against a running server.
 
 ---
 
@@ -54,14 +54,14 @@ All notable changes to the Zero-KV storage engine will be documented in this fil
 ### Added
 - **Fixed-Width Frames:** Established 16-byte request and 8-byte response frame specifications.
 - **Zerocopy Casting:** Integrated `zerocopy` for allocation-free byte-to-struct mapping.
-- **Endian Stability:** Implemented big-endian alignment for network interoperability.
+- **Endian Stability:** Encoded protocol integer fields in big-endian byte order.
 
 ---
 
 ## [Stage 2] - Memory-Mapped Storage
 
 ### Added
-- **Mmap Backend:** Implemented file-backed storage using `mmap2`.
+- **Mmap Backend:** Implemented file-backed storage using `memmap2`.
 - **Kernel Hinting:** Added `Advice::Random` (madvise) to optimize the kernel's page cache management for binary search patterns.
 
 ---
@@ -70,4 +70,4 @@ All notable changes to the Zero-KV storage engine will be documented in this fil
 
 ### Added
 - **The Baker Utility:** Created a CLI tool for pre-compiling and sorting database files.
-- **Structural Alignment:** Enforced 8-byte boundary alignment for all data entries to optimize CPU cache line utilization.
+- **Structural Alignment:** Enforced 8-byte boundary alignment for all data entries in the storage file.

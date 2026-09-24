@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tracing::{debug, error, info};
-use zerocopy::AsBytes; // we bring in the trait for direct .as_bytes() access
+use zerocopy::AsBytes;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -15,13 +15,11 @@ async fn main() -> Result<()> {
 
     info!("zero-kv engine initializing...");
 
-    // Load the immutable storage file into memory via Mmap.
+    // Map the immutable storage file; pages are loaded on demand.
     let storage = Storage::new(DEFAULT_STORAGE_PATH).expect("failed to load storage file");
     let engine = Arc::new(storage);
 
-    // Setup the Unix Domain Socket for low-latency local communication.
-    // We utilize Unix Domain Sockets to bypass the overhead of the loopback network stack,
-    // facilitating direct, low-latency IPC.
+    // Bind the local Unix domain socket.
     let path = DEFAULT_SOCKET_PATH;
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path).context("failed to bind to unix socket")?;
@@ -33,7 +31,7 @@ async fn main() -> Result<()> {
         let engine_clone = Arc::clone(&engine);
 
         tokio::spawn(async move {
-            // We use a 4KB buffer to ingest batches of 16-byte request frames.
+            // Buffer up to 256 fixed-size request frames.
             let mut read_buf = [0u8; 4096];
             let mut leftover = 0;
 
@@ -52,16 +50,8 @@ async fn main() -> Result<()> {
                 let mut consumed = 0;
 
                 {
-                    // We prepare IoSlices for vectored writes to achieve zero-copy transmission.
-                    // source_slices: Keeps track of the original &[u8] for offset calculation during partial writes.
-                    // response_slices: The actual IoSlices passed to the kernel.
-
-                    // We process requests in batches to amortize the cost of the `write_vectored` syscall.
-                    // By using stack-allocated arrays here, we ensure that the per-batch overhead
-                    // involves no heap allocations, keeping the latency predictable (P99 hardening).
-
-                    // A single request can result in at most 2 slices: the 8-byte response header
-                    // and the actual value data from the mmap.
+                    // Each response uses at most two slices: header and mapped value.
+                    // Retain source slices to rebuild IoSlices after partial writes.
 
                     let mut source_slices: [&[u8]; 512] = [&[]; 512];
                     let mut response_slices = [IoSlice::new(&[]); 512];
@@ -118,8 +108,7 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // We assemble the vectored I/O batch. This avoids copying data into a
-                    // contiguous response buffer before sending.
+                    // Gather headers and values without copying into a contiguous buffer.
                     for i in 0..current_response_count {
                         let header_bytes = response_headers[i].as_bytes();
                         source_slices[current_slice_count] = header_bytes;
@@ -132,11 +121,10 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // We execute the vectored write loop until the entire batch is sent.
+                    // Continue until the batch is sent or the connection fails.
                     if current_slice_count > 0 {
                         let mut current_idx = 0;
                         while current_idx < current_slice_count {
-                            // write_vectored transmits non-contiguous memory in a single syscall.
                             match socket
                                 .write_vectored(&response_slices[current_idx..current_slice_count])
                                 .await

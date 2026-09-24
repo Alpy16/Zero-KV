@@ -22,8 +22,8 @@ The engine is intentionally scoped around a simple workload: fast local lookups 
 * **Batched request handling:** Reads 4KB request batches and processes up to 256 pipelined requests per batch.
 * **Vectored responses:** Uses `write_vectored` to write response headers and value slices without assembling a separate contiguous response buffer.
 * **Partial-write safety:** Handles partial vectored writes by advancing through written slices until the full response batch is flushed.
-* **Cache-conscious layout:** Aligns stored value regions to 8-byte boundaries to simplify offset calculation and reduce unaligned access concerns.
-* **Reusable hot-path buffers:** Reuses stack-allocated response metadata inside the server loop to reduce allocator pressure during steady-state handling.
+* **Aligned value layout:** Pads stored values to 8-byte boundaries.
+* **Reusable response buffers:** Reuses fixed-size response metadata arrays within each connection task.
 
 ## Quickstart
 
@@ -50,6 +50,8 @@ Zero-KV expects a simple CSV-like input file:
 ```
 key,value
 ```
+
+There is no header row. Keys are unsigned 64-bit integers. The first comma separates the key from the value; additional commas remain part of the value. Leading and trailing whitespace is trimmed from both fields. Blank lines are ignored, lines without a comma are skipped with a warning, and invalid keys stop the bake.
 
 Example:
 
@@ -79,12 +81,12 @@ This creates:
 storage.db
 ```
 
-The server loads this file at startup.
+The server maps this file at startup. The baker refuses to overwrite an existing `storage.db`; stop the server and remove the old file before re-baking.
 
 ### Run the Server
 
 ```
-RUST_LOG=error cargo run --release --bin kv_store
+cargo run --release --bin kv_store
 ```
 
 By default, the server listens on:
@@ -101,7 +103,7 @@ In another terminal:
 cargo run --release --bin benchmarker
 ```
 
-The benchmarker launches 100 concurrent Unix socket clients, each sending 256-request pipelines against keys in the baked dataset.
+The benchmarker launches 100 concurrent Unix socket clients, each sending 256-request pipelines against keys 1 through 100,000. Bake the generated benchmark dataset above for an all-hit workload; the client does not check response statuses.
 
 ## Full Lifecycle Script
 
@@ -121,13 +123,15 @@ The script performs the following steps:
 5. Waits for the Unix socket to become available
 6. Runs the saturation benchmark
 7. Checks that the server survived the benchmark
-8. Cleans up temporary input files
+8. Removes the generated input file and stops the server on exit
+
+The script replaces `storage.db` and `server.log` and removes the existing socket path. Run it with the server stopped. It leaves the baked database, log, and socket path behind.
 
 ## Performance Metrics
 
 The benchmark is designed to measure saturated local read throughput under pipelined Unix Domain Socket traffic.
 
-Latest benchmark configuration:
+Benchmark configuration for the generated dataset:
 
 | Parameter          |                      Value |
 | ------------------ | -------------------------: |
@@ -140,7 +144,7 @@ Latest benchmark configuration:
 | Workload           |         Existing-key reads |
 | Hit rate           |                       100% |
 
-Latest observed result:
+Previously recorded result (not re-measured for the current implementation):
 
 | Metric            |                  Result |
 | ----------------- | ----------------------: |
@@ -149,7 +153,7 @@ Latest observed result:
 | Batch P99 latency |                 5.413ms |
 | Total requests    |             104,117,504 |
 
-Latency values represent completion time for a full 256-request pipeline, not individual request latency.
+Latency values represent completion time for a full 256-request pipeline, not individual request latency. Percentiles use at most the first 10,000 batches per client.
 
 Benchmark results are environment-dependent. The result above was collected in a local Linux/WSL2 environment using Unix Domain Sockets.
 
@@ -188,7 +192,7 @@ The baked database is immutable and laid out as:
 | IndexEntry[0]    |
 | IndexEntry[1]    |
 | ...              |
-| IndexEntry[n]    |
+| IndexEntry[n-1]  |
 +------------------+
 | Value bytes      |
 | 8-byte padding   |
@@ -198,20 +202,34 @@ The baked database is immutable and laid out as:
 +------------------+
 ```
 
-Each index entry stores:
+The 32-byte header stores:
 
 ```
-key:        u64
-val_offset: u64
-val_len:    u32
-padding:    u32
+magic:           u64  # 0xA016
+version:         u64  # 1
+count:           u64
+header_checksum: u32
+padding:         u32
 ```
+
+The header checksum is CRC32 over all 32 bytes with `header_checksum` set to zero.
+
+Each 24-byte index entry stores:
+
+```
+key:          u64
+val_offset:   u64
+val_len:      u32
+val_checksum: u32
+```
+
+Storage integers use native endianness. Offsets are absolute file offsets, lengths exclude padding, and `val_checksum` is CRC32 over the value bytes. Each successful lookup verifies the payload checksum, so its cost is O(log n + value length). The index itself has no checksum.
 
 Because index entries are fixed-width and sorted by key, lookups use binary search over the mapped index region.
 
 ## Protocol
 
-Each request is a fixed 16-byte frame:
+Protocol operation codes, keys, statuses, and lengths use big-endian encoding. Each request is a fixed 16-byte frame:
 
 ```
 op:      u32
@@ -241,7 +259,7 @@ Response statuses:
 |      1 | Not found |
 |      2 | Error     |
 
-If `length > 0`, the response header is followed by the value bytes.
+If `length > 0`, the response header is followed by the value bytes. `Exists` returns `Ok` or `Not found` with no payload, but still verifies the stored value checksum. Unknown operations and storage errors return `Error` with no payload.
 
 ## Architecture Decision Records
 
@@ -291,13 +309,15 @@ If `length > 0`, the response header is followed by the value bytes.
 
 **Decision:** Track the number of bytes written, advance through completed slices, trim partially written slices, and continue writing until the full response batch is sent.
 
-**Consequence:** The server preserves response framing correctness while keeping the zero-copy response path.
+**Consequence:** The server preserves response framing correctness while avoiding an intermediate contiguous response buffer. Socket writes still copy data into kernel buffers.
 
 ## Safety Notes
 
 The storage engine uses a raw pointer internally to reference the mapped index region.
 
-This avoids self-referential lifetime issues while allowing the read-only storage object to be shared across worker tasks. The pointer is derived from the owned mmap, the mmap length is validated before pointer construction, and the mapped file is never mutated by the engine after startup.
+The pointer is derived from the owned mmap and avoids storing a self-referential slice. The engine checks header magic, version, CRC32, and index size at startup, and value bounds and CRC32 during lookup. The engine does not modify the file.
+
+The backing file must not be modified or truncated while mapped. The raw index pointer also requires the mapping and header count to remain unchanged; both are currently public fields. Size calculations use unchecked arithmetic, so these checks do not make arbitrary malformed files safe to load.
 
 The server response path uses borrowed slices into preallocated response headers and mmap-backed values. Vectored writes are advanced carefully so partial writes do not corrupt the client-visible response stream.
 
@@ -305,12 +325,14 @@ The server response path uses borrowed slices into preallocated response headers
 
 * Read-only storage engine
 * No writes, deletes, compaction, or replication
-* No crash-recovery layer beyond immutable file loading
+* No crash-recovery layer; baking writes directly to the destination and flushes without `fsync` or atomic publication
 * Local IPC only through Unix Domain Sockets
 * Benchmark is optimized for local saturated read throughput
 * Batch latency is reported per 256-request pipeline, not per individual request
-* Current input format is simple CSV-like `key,value` and does not support escaping commas inside values
-* Benchmark workload currently measures 100% existing-key reads
+* Input is UTF-8 `key,value` text split at the first comma, without CSV quoting or multiline values
+* Duplicate keys are accepted; lookup does not specify which duplicate is returned
+* Storage files use native endianness and require a compatible host layout
+* Benchmark assumes keys 1 through 100,000 exist and does not validate response statuses
 
 ## License
 

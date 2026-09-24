@@ -1,8 +1,6 @@
 use std::io;
 use thiserror::Error;
 pub mod storage;
-/// We utilize `zerocopy` traits to facilitate safe, allocation-free casting of raw byte slices
-/// into structured memory layouts, minimizing CPU overhead during serialization and deserialization.
 use zerocopy::{
     AsBytes, FromBytes, FromZeroes,
     byteorder::network_endian::{U32, U64},
@@ -14,18 +12,13 @@ pub const DEFAULT_SOCKET_PATH: &str = "/tmp/zero-kv.sock";
 /// `ResponseStatus` defines the machine-readable outcome of a request.
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-// We use an explicit u32 discriminant to ensure the status fits perfectly into
-// i'm using an explicit u32 discriminant here so the status fits perfectly into
-// our 8-byte response header without any padding or alignment surprises.
 pub enum ResponseStatus {
     Ok = 0,
     NotFound = 1,
     Error = 2,
 }
 
-/// `EngineError` represents all possible failure modes during storage initialization
-/// or runtime request processing. This uses `thiserror` to provide descriptive
-/// error messages while maintaining compatibility with `anyhow`.
+/// Errors reported by the storage engine.
 #[derive(Error, Debug)]
 pub enum EngineError {
     #[error("Data corruption: Checksum mismatch")]
@@ -56,9 +49,7 @@ pub enum EngineError {
     MmapFailed(String),
 }
 
-/// The 'Header' sits at byte 0 of your file.
-/// We use `repr(C)` to ensure a stable memory layout across different compiler versions,
-/// which is critical for direct memory mapping of the database file.
+/// A 32-byte storage header at file offset zero, using native-endian integers.
 #[repr(C)]
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone)]
 pub struct Header {
@@ -66,14 +57,11 @@ pub struct Header {
     pub version: u64,
     pub count: u64,
     pub header_checksum: u32,
-    pub _padding: u32, // Adjusted to 32-bit to maintain 8-byte alignment for the total struct (32 bytes).
+    pub _padding: u32, // Explicit padding keeps the header at 32 bytes.
 }
 
-/// Each `IndexEntry` represents a fixed-width pointer to a value in the data section.
-/// These entries are stored in a contiguous array within the storage file, sorted by key.
-/// This layout allows the engine to locate any value using a binary search over the
-/// memory-mapped index section. We use the `val_checksum` field to store a CRC32C
-/// enabling O(1) integrity verification during the retrieval hot path.
+/// A 24-byte native-endian index entry, stored in key order.
+/// Lookups use binary search and verify CRC32 over the full value payload.
 #[repr(C)]
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone)]
 pub struct IndexEntry {
@@ -88,14 +76,13 @@ pub const HEADER_SIZE: usize = std::mem::size_of::<Header>();
 pub const INDEX_ENTRY_SIZE: usize = std::mem::size_of::<IndexEntry>();
 
 impl Header {
-    /// Per-flight check to ensure the file being loaded matches the engine's expectations.
+    /// Checks the magic number and version, without validating the checksum or bounds.
     pub fn is_valid(&self) -> bool {
         self.magic == 0xA016 && self.version == 1
     }
 }
 
-/// `OpCode` identifies the specific operation requested by the client.
-/// We limit these to 32-bit values to maintain alignment in the `Request` frame.
+/// Operation codes; unrecognized wire values map to `Unknown`.
 #[repr(u32)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum OpCode {
@@ -104,11 +91,8 @@ pub enum OpCode {
     Unknown = 99,
 }
 
-/// We enforce a 16-byte fixed-width request frame. By utilizing Big-Endian types,
-/// we ensure protocol compatibility across different CPU architectures.
-/// Alignment is set to 8 to ensure the `key` (U64) is naturally aligned,
-/// which prevents unaligned access penalties on certain architectures and
-/// simplifies direct memory casting.
+/// A 16-byte request frame with big-endian operation and key fields.
+/// The Rust struct has 8-byte alignment; decoding copies from any byte alignment.
 #[repr(C, align(8))]
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone)]
 pub struct Request {
@@ -117,11 +101,7 @@ pub struct Request {
     pub key: U64,      // automatically handles big-endian conversion for the 64-bit key.
 }
 
-/// The response header establishes a contract with the client, providing the
-/// operation status and the exact length of the trailing payload.
-/// This header is designed to be small (8 bytes) so it can be sent
-/// in the same packet as the data payload during vectored writes,
-/// minimizing network fragmentation.
+/// An 8-byte response header with big-endian status and payload length.
 #[repr(C, align(8))]
 #[derive(AsBytes, FromBytes, FromZeroes, Debug, Copy, Clone, Default)]
 pub struct ResponseHeader {
@@ -130,8 +110,8 @@ pub struct ResponseHeader {
 }
 
 impl Request {
-    /// Safely attempts to interpret a raw byte slice as a `Request` frame.
-    /// Returns `None` if the slice length is insufficient or alignment is invalid.
+    /// Copies a request from exactly 16 bytes, regardless of input alignment.
+    /// Returns `None` if the slice length differs.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         Self::read_from(bytes)
     }
@@ -178,11 +158,8 @@ mod tests {
 
         let bytes = original_req.to_bytes();
 
-        // we decode the bytes back into a `Request` struct.
         let decoded_req = Request::from_bytes(&bytes).expect("Failed to decode");
 
-        // we assert that the decoded request matches the original, using `.get()`
-        // to retrieve the native endian values for comparison.
         assert_eq!(original_req.op.get(), decoded_req.op.get());
         assert_eq!(original_req.key.get(), decoded_req.key.get());
     }
